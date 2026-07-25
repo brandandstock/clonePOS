@@ -94,12 +94,12 @@ const double _oFlankSecondY = _oFlankTopY + _oFlankH + _oFlankGap;
 // flank's left edge. All summary-column and tile-grid coords live inside
 // this rectangle regardless of which side the summary is on.
 const double _oCentralStartX = 137;
-const double _oCentralEndX = 1143;      // 893 (summary right edge cap) + 250
+const double _oCentralEndX = 1143; // 893 (summary right edge cap) + 250
 
 // Summary column geometry — 250 wide, title cell (115 tall) + gap +
 // big cell (585 tall). Its X flips based on `_settingsMode`.
-const double _oSummaryLeftX = 137;      // default (Image 1)
-const double _oSummaryRightX = 893;     // settings mode (Image 2)
+const double _oSummaryLeftX = 137; // default (Image 1)
+const double _oSummaryRightX = 893; // settings mode (Image 2)
 const double _oTileW = 250;
 const double _oTileH = 350;
 const double _oGridGap = 2;
@@ -111,8 +111,8 @@ const double _oSummaryBigH = 585;
 // 3×2 tile grid — 3 cols × 250w, 2 rows × 350h at y=34/386. Its start X
 // flips: when summary is on the LEFT the tiles start at x=389; when the
 // summary is on the RIGHT the tiles start at x=137.
-const double _oTileGridDefaultX = 389;   // summary on LEFT (Image 1)
-const double _oTileGridSettingsX = 137;  // summary on RIGHT (Image 2)
+const double _oTileGridDefaultX = 389; // summary on LEFT (Image 1)
+const double _oTileGridSettingsX = 137; // summary on RIGHT (Image 2)
 const double _oGridStartY = _oFlankTopY;
 
 // Rails in opened state — bar height unchanged (300), y=344.
@@ -122,7 +122,6 @@ const double _oRailTop = 344;
 const double _oChevronX = 1172;
 const double _oChevronY = 668;
 const double _oChevronSize = 70;
-
 
 // Fill colors used by the flank badges.
 const Color _oCartsOrange = Color(0xFFE87722);
@@ -144,6 +143,7 @@ class MasterDashboardScreen extends StatefulWidget {
 class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   int _selectedIndex = 0;
   int? _openedIndex;
+
   /// One of the 6 right-tile slots the user tapped inside the opened
   /// tab (1..6). null = the tab is on its landing grid; non-null = the
   /// in-place sub-detail panel is shown covering the whole tile grid.
@@ -220,8 +220,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
 
   /// Right-flank top badge — swaps the summary column side and its
   /// title. Persists until the user toggles again or closes the tab.
-  void _toggleSettingsMode() =>
-      setState(() => _settingsMode = !_settingsMode);
+  void _toggleSettingsMode() => setState(() => _settingsMode = !_settingsMode);
 
   /// Right-flank back button. Pops one level at a time:
   ///   - if a sub-detail panel is up, close it → back to the tile grid
@@ -260,181 +259,194 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Responsive shell: the design lives inside a fixed 1280×800
+    // canvas scaled to fit the device via FittedBox (preserves the
+    // design aspect — no distortion). The mesh backdrop sits OUTSIDE
+    // that canvas so it fills the entire device on any aspect ratio;
+    // on iPad Pro 13" (~4:3) the extra space above/below the design
+    // canvas is now the gradient continuing rather than a black bar.
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Center(
-        child: FittedBox(
-          fit: BoxFit.contain,
-          child: SizedBox(
-            width: kMasterCanvasWidth,
-            height: kMasterCanvasHeight,
-            child: Stack(
-              children: [
-                // Mesh-gradient backdrop.
-                const Positioned.fill(child: _MeshBackdrop()),
+      body: Stack(
+        children: [
+          const Positioned.fill(child: _MeshBackdrop()),
+          Center(
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: SizedBox(
+                width: kMasterCanvasWidth,
+                height: kMasterCanvasHeight,
+                child: Stack(
+                  children: [
+                    // Backdrop moved out to the device-fill layer above;
+                    // the design stack no longer draws its own so the
+                    // rails/tiles composite directly onto the shared
+                    // gradient.
 
-                // Central content — landing 4x2 grid, or the new opened
-                // template (flank badges + title column + 6 right tiles).
-                if (_isOpened) ..._buildOpenedLayout()
-                else ..._buildTiles(),
+                    // Central content — landing 4x2 grid, or the new opened
+                    // template (flank badges + title column + 6 right tiles).
+                    if (_isOpened)
+                      ..._buildOpenedLayout()
+                    else
+                      ..._buildTiles(),
 
-                // Visible L-hook rails. Position moves for opened state
-                // so the chevron_back can sit below without overlap.
-                //
-                // No scrollController here on purpose: the dot must stay
-                // parked at the hook tip regardless of scroll. Wiring it
-                // to the inner pane's scroll caused (a) the dot sliding
-                // down while browsing, and (b) a setState on every scroll
-                // pixel — the biggest source of scroll lag on the tablet.
-                // The invisible gesture zones below still take the
-                // controllers, so finger-drag on the rail still scrolls
-                // the pane.
-                Positioned(
-                  left: _railLeftX,
-                  top: _isOpened ? _oRailTop : _railTop,
-                  width: _railW,
-                  height: _railH,
-                  child: const IgnorePointer(
-                    child: FlankRail(
-                      itemCount: 8,
-                      side: RailSide.left,
-                      showVisual: true,
+                    // Visible L-hook rails. Position moves for opened state
+                    // so the chevron_back can sit below without overlap.
+                    //
+                    // No scrollController here on purpose: the dot must stay
+                    // parked at the hook tip regardless of scroll. Wiring it
+                    // to the inner pane's scroll caused (a) the dot sliding
+                    // down while browsing, and (b) a setState on every scroll
+                    // pixel — the biggest source of scroll lag on the tablet.
+                    // The invisible gesture zones below still take the
+                    // controllers, so finger-drag on the rail still scrolls
+                    // the pane.
+                    Positioned(
+                      left: _railLeftX,
+                      top: _isOpened ? _oRailTop : _railTop,
+                      width: _railW,
+                      height: _railH,
+                      child: const IgnorePointer(
+                        child: FlankRail(
+                          itemCount: 8,
+                          side: RailSide.left,
+                          showVisual: true,
+                        ),
+                      ),
                     ),
-                  ),
+                    Positioned(
+                      left: _railRightX,
+                      top: _isOpened ? _oRailTop : _railTop,
+                      width: _railW,
+                      height: _railH,
+                      child: const IgnorePointer(
+                        child: FlankRail(
+                          itemCount: 8,
+                          side: RailSide.right,
+                          showVisual: true,
+                        ),
+                      ),
+                    ),
+
+                    // Invisible flank gesture zones — LANDING ONLY.
+                    // Vertical drag → step selection; horizontal → open.
+                    if (!_isOpened) ...[
+                      Positioned(
+                        left: _railLeftX - _railTouchPad,
+                        top: _railTop - _railTouchPad,
+                        width: _railW + _railTouchPad * 2,
+                        height: _railH + _railTouchPad * 2,
+                        child: FlankRail(
+                          itemCount: _tiles.length,
+                          side: RailSide.left,
+                          selectedIndex: _selectedIndex,
+                          showVisual: false,
+                          onSelected: _selectTile,
+                          onSwipeOpen: _openTile,
+                        ),
+                      ),
+                      Positioned(
+                        left: _railRightX - _railTouchPad,
+                        top: _railTop - _railTouchPad,
+                        width: _railW + _railTouchPad * 2,
+                        height: _railH + _railTouchPad * 2,
+                        child: FlankRail(
+                          itemCount: _tiles.length,
+                          side: RailSide.right,
+                          selectedIndex: _selectedIndex,
+                          showVisual: false,
+                          onSelected: _selectTile,
+                          onSwipeOpen: _openTile,
+                        ),
+                      ),
+                    ],
+
+                    // Invisible flank gesture zones — ANY OPENED TAB
+                    // (except while a sub-detail panel is up). Universal
+                    // scroller roles per client:
+                    //   LEFT rail  → horizontal scroll controller
+                    //   RIGHT rail → vertical scroll controller
+                    // Rails render on every feature page; when the current
+                    // tab has nothing attached to a controller the rail is
+                    // safely idle (FlankRail bails on !hasClients).
+                    if (_isOpened && _openSubIndex == null) ...[
+                      Positioned(
+                        left: _railLeftX - _railTouchPad,
+                        top: _oRailTop - _railTouchPad,
+                        width: _railW + _railTouchPad * 2,
+                        height: _railH + _railTouchPad * 2,
+                        child: FlankRail(
+                          itemCount: _tiles.length,
+                          side: RailSide.left,
+                          showVisual: false,
+                          scrollController: _leftRailHorizontalCtrl,
+                        ),
+                      ),
+                      Positioned(
+                        left: _railRightX - _railTouchPad,
+                        top: _oRailTop - _railTouchPad,
+                        width: _railW + _railTouchPad * 2,
+                        height: _railH + _railTouchPad * 2,
+                        child: FlankRail(
+                          itemCount: _tiles.length,
+                          side: RailSide.right,
+                          showVisual: false,
+                          scrollController: _rightRailVerticalCtrl,
+                        ),
+                      ),
+                    ],
+
+                    // Sun icon — LANDING ONLY. In opened state the sun sits
+                    // inside an orange flank badge (built by _buildOpenedLayout).
+                    if (!_isOpened)
+                      Positioned(
+                        left: _sunX,
+                        top: _sunY,
+                        width: _sunSize,
+                        height: _sunSize,
+                        child: _SunButton(
+                          active: _sunMenuOpen,
+                          onTap: _toggleSunMenu,
+                        ),
+                      ),
+
+                    // In-place sub-detail panel — fills the entire central
+                    // rectangle (tile grid + summary column) when the user
+                    // tapped one of the 6 tiles.
+                    if (_isOpened && _openSubIndex != null)
+                      Positioned(
+                        left: _oCentralStartX,
+                        top: _oFlankTopY,
+                        width: _oCentralEndX - _oCentralStartX,
+                        height: _oTileH * 2 + _oGridGap,
+                        child: _SubDetailPanel(
+                          title: _subDetailTitle(),
+                        ),
+                      ),
+
+                    // Sun popover. Anchors under the sun in landing, or
+                    // under the orange sun-badge in opened state.
+                    if (_sunMenuOpen)
+                      Positioned(
+                        top: _isOpened
+                            ? _oFlankTopY + _oFlankH + 8
+                            : _sunY + _sunSize + 8,
+                        left: _isOpened ? _oRightColX - 60 : _sunX - 140,
+                        child: _SunMenu(
+                          darkMode: _darkMode,
+                          onDismiss: _toggleSunMenu,
+                          onToggleTheme: () => setState(() {
+                            _darkMode = !_darkMode;
+                            _sunMenuOpen = false;
+                          }),
+                        ),
+                      ),
+                  ],
                 ),
-                Positioned(
-                  left: _railRightX,
-                  top: _isOpened ? _oRailTop : _railTop,
-                  width: _railW,
-                  height: _railH,
-                  child: const IgnorePointer(
-                    child: FlankRail(
-                      itemCount: 8,
-                      side: RailSide.right,
-                      showVisual: true,
-                    ),
-                  ),
-                ),
-
-                // Invisible flank gesture zones — LANDING ONLY.
-                // Vertical drag → step selection; horizontal → open.
-                if (!_isOpened) ...[
-                  Positioned(
-                    left: _railLeftX - _railTouchPad,
-                    top: _railTop - _railTouchPad,
-                    width: _railW + _railTouchPad * 2,
-                    height: _railH + _railTouchPad * 2,
-                    child: FlankRail(
-                      itemCount: _tiles.length,
-                      side: RailSide.left,
-                      selectedIndex: _selectedIndex,
-                      showVisual: false,
-                      onSelected: _selectTile,
-                      onSwipeOpen: _openTile,
-                    ),
-                  ),
-                  Positioned(
-                    left: _railRightX - _railTouchPad,
-                    top: _railTop - _railTouchPad,
-                    width: _railW + _railTouchPad * 2,
-                    height: _railH + _railTouchPad * 2,
-                    child: FlankRail(
-                      itemCount: _tiles.length,
-                      side: RailSide.right,
-                      selectedIndex: _selectedIndex,
-                      showVisual: false,
-                      onSelected: _selectTile,
-                      onSwipeOpen: _openTile,
-                    ),
-                  ),
-                ],
-
-                // Invisible flank gesture zones — ANY OPENED TAB
-                // (except while a sub-detail panel is up). Universal
-                // scroller roles per client:
-                //   LEFT rail  → horizontal scroll controller
-                //   RIGHT rail → vertical scroll controller
-                // Rails render on every feature page; when the current
-                // tab has nothing attached to a controller the rail is
-                // safely idle (FlankRail bails on !hasClients).
-                if (_isOpened && _openSubIndex == null) ...[
-                  Positioned(
-                    left: _railLeftX - _railTouchPad,
-                    top: _oRailTop - _railTouchPad,
-                    width: _railW + _railTouchPad * 2,
-                    height: _railH + _railTouchPad * 2,
-                    child: FlankRail(
-                      itemCount: _tiles.length,
-                      side: RailSide.left,
-                      showVisual: false,
-                      scrollController: _leftRailHorizontalCtrl,
-                    ),
-                  ),
-                  Positioned(
-                    left: _railRightX - _railTouchPad,
-                    top: _oRailTop - _railTouchPad,
-                    width: _railW + _railTouchPad * 2,
-                    height: _railH + _railTouchPad * 2,
-                    child: FlankRail(
-                      itemCount: _tiles.length,
-                      side: RailSide.right,
-                      showVisual: false,
-                      scrollController: _rightRailVerticalCtrl,
-                    ),
-                  ),
-                ],
-
-                // Sun icon — LANDING ONLY. In opened state the sun sits
-                // inside an orange flank badge (built by _buildOpenedLayout).
-                if (!_isOpened)
-                  Positioned(
-                    left: _sunX,
-                    top: _sunY,
-                    width: _sunSize,
-                    height: _sunSize,
-                    child: _SunButton(
-                      active: _sunMenuOpen,
-                      onTap: _toggleSunMenu,
-                    ),
-                  ),
-
-                // In-place sub-detail panel — fills the entire central
-                // rectangle (tile grid + summary column) when the user
-                // tapped one of the 6 tiles.
-                if (_isOpened && _openSubIndex != null)
-                  Positioned(
-                    left: _oCentralStartX,
-                    top: _oFlankTopY,
-                    width: _oCentralEndX - _oCentralStartX,
-                    height: _oTileH * 2 + _oGridGap,
-                    child: _SubDetailPanel(
-                      title: _subDetailTitle(),
-                    ),
-                  ),
-
-                // Sun popover. Anchors under the sun in landing, or
-                // under the orange sun-badge in opened state.
-                if (_sunMenuOpen)
-                  Positioned(
-                    top: _isOpened
-                        ? _oFlankTopY + _oFlankH + 8
-                        : _sunY + _sunSize + 8,
-                    left: _isOpened
-                        ? _oRightColX - 60
-                        : _sunX - 140,
-                    child: _SunMenu(
-                      darkMode: _darkMode,
-                      onDismiss: _toggleSunMenu,
-                      onToggleTheme: () => setState(() {
-                        _darkMode = !_darkMode;
-                        _sunMenuOpen = false;
-                      }),
-                    ),
-                  ),
-              ],
+              ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -455,10 +467,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     const centralH = _oTileH * 2 + _oGridGap;
 
     final summaryX = _settingsMode ? _oSummaryRightX : _oSummaryLeftX;
-    final tileGridX =
-        _settingsMode ? _oTileGridSettingsX : _oTileGridDefaultX;
-    final summaryTitle =
-        _settingsMode ? 'SETTINGS' : openedLabel.toUpperCase();
+    final tileGridX = _settingsMode ? _oTileGridSettingsX : _oTileGridDefaultX;
+    final summaryTitle = _settingsMode ? 'SETTINGS' : openedLabel.toUpperCase();
 
     return [
       // ─── LEFT FLANK ─── ACTIVE CARTS + ACTIVE CLONES badges.
@@ -616,46 +626,58 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   List<String>? _rightTileLabelsFor(String openedLabel) {
     switch (openedLabel) {
       case 'Active Carts':
-        return const ['Cart 1', 'Cart 2', 'Cart 3',
-                      'Cart 4', 'Cart 5', 'Cart 6'];
+        return const [
+          'Cart 1',
+          'Cart 2',
+          'Cart 3',
+          'Cart 4',
+          'Cart 5',
+          'Cart 6'
+        ];
       case 'Active Clones':
-        return const ['Clone 1', 'Clone 2', 'Clone 3',
-                      'Clone 4', 'Clone 5', 'Clone 6'];
+        return const [
+          'Clone 1',
+          'Clone 2',
+          'Clone 3',
+          'Clone 4',
+          'Clone 5',
+          'Clone 6'
+        ];
       case 'Logistics':
         return const [
-          'Inbound',    // supplier deliveries landing at the warehouse
-          'Outbound',   // orders leaving to customers
+          'Inbound', // supplier deliveries landing at the warehouse
+          'Outbound', // orders leaving to customers
           'In Transit', // active shipments on the road
-          'Returns',    // RTO + customer-initiated returns
-          'Fleet',      // vehicles + drivers status
-          'Suppliers',  // open POs + supplier contact
+          'Returns', // RTO + customer-initiated returns
+          'Fleet', // vehicles + drivers status
+          'Suppliers', // open POs + supplier contact
         ];
       case 'Analytics':
         return const [
-          'Sales',       // revenue trend — day / week / month
+          'Sales', // revenue trend — day / week / month
           'Top Sellers', // best-performing SKUs and categories
           'Slow Movers', // inventory ageing / underperforming SKUs
-          'Customers',   // repeat rate, tier distribution, lifetime value
-          'Staff',       // per-cashier throughput and conversion
-          'Peak Hours',  // footfall heatmap and busiest windows
+          'Customers', // repeat rate, tier distribution, lifetime value
+          'Staff', // per-cashier throughput and conversion
+          'Peak Hours', // footfall heatmap and busiest windows
         ];
       case 'Accounts':
         return const [
-          'Invoices',    // customer invoices issued
-          'Payments',    // money received (UPI, card, cash, bank)
-          'Refunds',     // money out — refunds against returns
-          'Taxes',       // GST returns and tax filings
-          'Expenses',    // rent, utilities, wages, other opex
-          'Ledger',      // general ledger + journal entries
+          'Invoices', // customer invoices issued
+          'Payments', // money received (UPI, card, cash, bank)
+          'Refunds', // money out — refunds against returns
+          'Taxes', // GST returns and tax filings
+          'Expenses', // rent, utilities, wages, other opex
+          'Ledger', // general ledger + journal entries
         ];
       case 'Data':
         return const [
-          'Customers',   // customer master + contact directory
-          'Employees',   // staff/user master, roles, permissions
-          'Suppliers',   // vendor master + contract terms
-          'Documents',   // uploaded PDFs, invoices, receipts
-          'Exports',     // CSV / Excel data exports
-          'Backups',     // backup + restore operations
+          'Customers', // customer master + contact directory
+          'Employees', // staff/user master, roles, permissions
+          'Suppliers', // vendor master + contract terms
+          'Documents', // uploaded PDFs, invoices, receipts
+          'Exports', // CSV / Excel data exports
+          'Backups', // backup + restore operations
         ];
       default:
         return null;
@@ -788,9 +810,18 @@ class _MeshBackdrop extends StatelessWidget {
             child: ColoredBox(color: Color(0xFF1A1A1A)),
           ),
           _blob(top: -80, left: -60, size: 620, color: const Color(0xFF1E5B3E)),
-          _blob(top: -100, right: -80, size: 500, color: const Color(0xFF0F5555)),
-          _blob(bottom: -80, left: -60, size: 520, color: const Color(0xFF6E5820)),
-          _blob(bottom: -100, right: -80, size: 600, color: const Color(0xFF6A2A3A)),
+          _blob(
+              top: -100, right: -80, size: 500, color: const Color(0xFF0F5555)),
+          _blob(
+              bottom: -80,
+              left: -60,
+              size: 520,
+              color: const Color(0xFF6E5820)),
+          _blob(
+              bottom: -100,
+              right: -80,
+              size: 600,
+              color: const Color(0xFF6A2A3A)),
           _blob(top: 300, left: 400, size: 500, color: const Color(0xFF3A2A5A)),
         ],
       ),
@@ -933,7 +964,9 @@ class _SunMenu extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             _SunMenuRow(
-              icon: darkMode ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+              icon: darkMode
+                  ? Icons.light_mode_outlined
+                  : Icons.dark_mode_outlined,
               label: darkMode ? 'Light mode' : 'Dark mode',
               onTap: onToggleTheme,
             ),
