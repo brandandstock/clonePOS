@@ -62,7 +62,6 @@ class _IconIndexRailState extends State<IconIndexRail>
   static const double _columnWidth = 60;
   static const double _bubbleGap = 4;
   static const double _bubbleSize = 92;
-  static const double _iconSize = 22;
 
   // Wave shape — same idea as the letter rail, tuned for the smaller
   // item count. Fewer, larger items → a wider softer wave feels right.
@@ -290,7 +289,7 @@ class _IconIndexRailState extends State<IconIndexRail>
             final visible = touchY != null;
             final travel = panelHeight - _bubbleSize;
             final centreY = visible
-                ? (verticalPad + touchY!).clamp(
+                ? (verticalPad + touchY).clamp(
                     _bubbleSize / 2, panelHeight - _bubbleSize / 2)
                 : panelHeight / 2;
             final alignmentY = travel <= 0

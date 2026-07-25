@@ -1,5 +1,4 @@
 import 'dart:math' as math;
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -231,7 +230,7 @@ class _AlphabetIndexRailState extends State<AlphabetIndexRail>
             final visible = touchY != null;
             final travel = panelHeight - _bubbleSize;
             final centreY = visible
-                ? (verticalPad + touchY!).clamp(
+                ? (verticalPad + touchY).clamp(
                     _bubbleSize / 2, panelHeight - _bubbleSize / 2)
                 : panelHeight / 2;
             final alignmentY = travel <= 0
