@@ -163,14 +163,11 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // controller matches its axis; tabs without scrollable content
   // leave both controllers unattached and the rails idle harmlessly.
   //
-  // Inventory is the exception: its LEFT rail is repurposed as a
-  // card selector via [_inventorySelection] (see FlankRail block in
-  // build). The horizontal scroll controller stays wired for other
-  // opened tabs.
+  // Inventory-specific: LEFT rail scrolls the filter panel (attached
+  // inside InventoryOpenedView via filterScrollController), RIGHT rail
+  // scrolls the tile grid.
   final ScrollController _leftRailHorizontalCtrl = ScrollController();
   final ScrollController _rightRailVerticalCtrl = ScrollController();
-  final InventorySelectionController _inventorySelection =
-      InventorySelectionController();
 
   // Reference the currently-mounted InventoryOpenedView so the shared
   // chevron_back can drill up through its category/sub/product/detail
@@ -182,7 +179,6 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   void dispose() {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
-    _inventorySelection.dispose();
     super.dispose();
   }
 
@@ -361,37 +357,18 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
                 // Rails render on every feature page; when the current
                 // tab has nothing attached to a controller the rail is
                 // safely idle (FlankRail bails on !hasClients).
-                //
-                // Inventory-only override: LEFT rail becomes a card
-                // selector driven by [_inventorySelection] — vertical
-                // drag steps through categories / sub-cats / products,
-                // horizontal swipe opens the highlighted tile.
                 if (_isOpened && _openSubIndex == null) ...[
                   Positioned(
                     left: _railLeftX - _railTouchPad,
                     top: _oRailTop - _railTouchPad,
                     width: _railW + _railTouchPad * 2,
                     height: _railH + _railTouchPad * 2,
-                    child: _tiles[_openedIndex!].label == 'Inventory'
-                        ? ListenableBuilder(
-                            listenable: _inventorySelection,
-                            builder: (context, _) => FlankRail(
-                              itemCount: _inventorySelection.itemCount,
-                              selectedIndex:
-                                  _inventorySelection.selectedIndex,
-                              side: RailSide.left,
-                              showVisual: false,
-                              onSelected: _inventorySelection.select,
-                              onSwipeOpen: (_) =>
-                                  _inventorySelection.openSelected(),
-                            ),
-                          )
-                        : FlankRail(
-                            itemCount: _tiles.length,
-                            side: RailSide.left,
-                            showVisual: false,
-                            scrollController: _leftRailHorizontalCtrl,
-                          ),
+                    child: FlankRail(
+                      itemCount: _tiles.length,
+                      side: RailSide.left,
+                      showVisual: false,
+                      scrollController: _leftRailHorizontalCtrl,
+                    ),
                   ),
                   Positioned(
                     left: _railRightX - _railTouchPad,
@@ -520,7 +497,6 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
             settingsMode: _settingsMode,
             scrollController: _rightRailVerticalCtrl,
             filterScrollController: _leftRailHorizontalCtrl,
-            selectionController: _inventorySelection,
           ),
         )
       else ...[

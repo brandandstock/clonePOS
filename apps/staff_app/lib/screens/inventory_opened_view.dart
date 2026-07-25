@@ -2,53 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:clone_pos_core/models/product.dart';
 import '../data/seed_products_cybergic_500.dart';
 
-/// Border color used to mark the currently-selected tile when the left
-/// flank rail is driving Inventory as a card selector. Matches the
-/// blue selection border on the landing-grid tiles.
-const Color _kInventorySelectionBlue = Color(0xFF3AA0FF);
-const double _kInventorySelectionBorderWidth = 3;
-
-/// Bridge between [InventoryOpenedView] (owner of drill + filter state)
-/// and the master dashboard's LEFT flank rail. In Inventory the left
-/// rail is repurposed as a card selector — vertical drag steps through
-/// the visible tiles, horizontal swipe opens the highlighted one — so
-/// the rail needs to see the current tile count and selection, and
-/// route step/open events back into the view.
-///
-/// The view calls [_bind] at the end of every setState (and once after
-/// mount) with fresh count/index plus callbacks. The dashboard wraps
-/// the rail in a [ListenableBuilder] on this controller.
-class InventorySelectionController extends ChangeNotifier {
-  int _itemCount = 0;
-  int _selectedIndex = 0;
-  void Function(int)? _onSelect;
-  VoidCallback? _onOpen;
-
-  int get itemCount => _itemCount;
-  int get selectedIndex => _selectedIndex;
-
-  void _bind({
-    required int itemCount,
-    required int selectedIndex,
-    required void Function(int) onSelect,
-    required VoidCallback onOpen,
-  }) {
-    _onSelect = onSelect;
-    _onOpen = onOpen;
-    if (_itemCount != itemCount || _selectedIndex != selectedIndex) {
-      _itemCount = itemCount;
-      _selectedIndex = selectedIndex;
-      notifyListeners();
-    }
-  }
-
-  /// Called by the rail when the finger scrubs to a new row.
-  void select(int i) => _onSelect?.call(i);
-
-  /// Called by the rail on horizontal swipe-open.
-  void openSelected() => _onOpen?.call();
-}
-
 /// Inventory dashboard for the opened-state template. Fills the
 /// tile-grid + summary-column area with two panes; `settingsMode`
 /// flips which side the summary column lives on:
@@ -78,16 +31,10 @@ class InventoryOpenedView extends StatefulWidget {
   /// dashboard wires this to the RIGHT flank rail (vertical scroll).
   final ScrollController? scrollController;
 
-  /// Horizontal scroll controller for the category chip strip in the
-  /// summary column's title cell — the parent dashboard wires this
-  /// to the LEFT flank rail (horizontal scroll).
+  /// Scroll controller for the filter panel in the summary column —
+  /// the parent dashboard wires this to the LEFT flank rail so a
+  /// vertical drag on the rail scrolls the filter section.
   final ScrollController? filterScrollController;
-
-  /// LEFT flank rail is repurposed inside Inventory as a card selector
-  /// (see [InventorySelectionController]). The parent dashboard passes
-  /// the controller here so the view can publish its current tile
-  /// count / selected index and receive step/open callbacks.
-  final InventorySelectionController? selectionController;
 
   /// Off (default) → summary column renders on the LEFT with title
   /// "INVENTORY" (matches Image 1 / Figma 369:158).
@@ -100,7 +47,6 @@ class InventoryOpenedView extends StatefulWidget {
     super.key,
     this.scrollController,
     this.filterScrollController,
-    this.selectionController,
     this.settingsMode = false,
   });
 
@@ -139,19 +85,6 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   _SortMode _sort = _SortMode.aToZ;
 
   late final TextEditingController _searchCtrl = TextEditingController();
-
-  // ── Left-rail selection ──────────────────────────────────────────────
-  // Index of the tile currently highlighted for open-on-swipe by the
-  // left flank rail. Reset to 0 on any level change; clamped after
-  // filter changes shrink the visible list. `_selectedTileKey` is
-  // reattached to whichever tile is selected in the current build so
-  // Scrollable.ensureVisible can scroll it into view after a step.
-  int _selectedIndex = 0;
-  final GlobalKey _selectedTileKey = GlobalKey();
-  // Count of tiles currently visible under the active level + filters.
-  // Refreshed inside build() before the grid is constructed and read
-  // out to the InventorySelectionController post-frame.
-  int _visibleCount = 0;
 
   // ── Derived-data caches ───────────────────────────────────────────────
   // Every rebuild used to iterate 500 products through _productsInScope,
@@ -200,21 +133,18 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
         _category = cat;
         _subCategory = null;
         _level = _Level.subCategories;
-        _selectedIndex = 0;
         _rebuildDrillCaches();
       });
 
   void _drillIntoSubCategory(String sub) => setState(() {
         _subCategory = sub;
         _level = _Level.products;
-        _selectedIndex = 0;
         _rebuildDrillCaches();
       });
 
   void _drillIntoProduct(Product p) => setState(() {
         _focusedProduct = p;
         _level = _Level.productDetail;
-        _selectedIndex = 0;
         // Drill scope unchanged — focused product is a leaf; no cache reset.
       });
 
@@ -237,58 +167,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
           case _Level.categories:
             break;
         }
-        _selectedIndex = 0;
       });
-
-  // ----- Left-rail selection API (called via GlobalKey by master) ---------
-
-  /// Route a rail-driven selection step. Clamps + scrolls the selected
-  /// tile into view after the frame paints.
-  void _handleRailSelect(int i) {
-    if (_visibleCount <= 0) return;
-    final next = i.clamp(0, _visibleCount - 1);
-    if (next == _selectedIndex) return;
-    setState(() => _selectedIndex = next);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final ctx = _selectedTileKey.currentContext;
-      if (ctx != null) {
-        Scrollable.ensureVisible(
-          ctx,
-          alignment: 0.5,
-          duration: const Duration(milliseconds: 160),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
-
-  /// Route a rail-driven "open" (horizontal swipe). Opens whatever the
-  /// _selectedIndex points at inside the current level's tile list.
-  void _handleRailOpen() {
-    if (_visibleCount <= 0) return;
-    switch (_level) {
-      case _Level.categories:
-        final entries = _computeCategoryEntries();
-        if (_selectedIndex < entries.length) {
-          _drillIntoCategory(entries[_selectedIndex].key);
-        }
-        break;
-      case _Level.subCategories:
-        final entries = _computeSubCategoryEntries();
-        if (_selectedIndex < entries.length) {
-          _drillIntoSubCategory(entries[_selectedIndex].key);
-        }
-        break;
-      case _Level.products:
-        final list = _computeProductList();
-        if (_selectedIndex < list.length) {
-          _drillIntoProduct(list[_selectedIndex]);
-        }
-        break;
-      case _Level.productDetail:
-        break;
-    }
-  }
 
   void _resetFilters() => setState(() {
         _search = '';
@@ -296,38 +175,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
         _brandFilter = null;
         _inStockOnly = false;
         _sort = _SortMode.aToZ;
-        _selectedIndex = 0;
       });
-
-  // ----- Tile-list computation --------------------------------------------
-  // Both build() and _handleRailOpen() need the current level's tile
-  // list. Kept in dedicated helpers so index-into-list stays consistent
-  // between what the grid paints and what the rail opens.
-
-  List<MapEntry<String, List<Product>>> _computeCategoryEntries() {
-    final filtered = _applyFilters(_productsInScope);
-    final byCat = <String, List<Product>>{};
-    for (final p in filtered) {
-      byCat.putIfAbsent(p.category, () => []).add(p);
-    }
-    return byCat.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
-  }
-
-  List<MapEntry<String, List<Product>>> _computeSubCategoryEntries() {
-    final filtered = _applyFilters(_productsInScope);
-    final bySub = <String, List<Product>>{};
-    for (final p in filtered) {
-      final sub = (p.subCategory?.trim().isNotEmpty ?? false)
-          ? p.subCategory!
-          : 'General';
-      bySub.putIfAbsent(sub, () => []).add(p);
-    }
-    return bySub.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
-  }
-
-  List<Product> _computeProductList() {
-    return _applyFilters(_productsInScope).toList()..sort(_compareByMode);
-  }
 
   // ----- Derived data ------------------------------------------------------
 
@@ -429,14 +277,16 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   }
 
   Widget _buildFilterCell() {
-    // Filter panel — fits comfortably in 585 tall so no scroll needed,
-    // but wrap in a SingleChildScrollView (no controller) as a safety
-    // valve for tiny screens or extra filters later.
+    // Filter panel — fits comfortably in 585 tall so no scroll needed
+    // at the current field count, but wrapped in a SingleChildScrollView
+    // so the LEFT flank rail (via widget.filterScrollController) can
+    // scroll it when the field list grows or the pane shrinks.
     final title = widget.settingsMode ? 'SETTINGS' : 'INVENTORY';
     return Material(
       color: const Color(0xFFD9D9D9),
       borderRadius: BorderRadius.circular(10),
       child: SingleChildScrollView(
+        controller: widget.filterScrollController,
         padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -458,10 +308,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
             _label('SEARCH'),
             TextField(
               controller: _searchCtrl,
-              onChanged: (v) => setState(() {
-                _search = v;
-                _selectedIndex = 0;
-              }),
+              onChanged: (v) => setState(() => _search = v),
               decoration: InputDecoration(
                 isDense: true,
                 prefixIcon: const Icon(Icons.search, size: 18),
@@ -481,30 +328,22 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
             _label('SORT'),
             _SortDropdown(
               value: _sort,
-              onChanged: (v) => setState(() {
-                _sort = v;
-                _selectedIndex = 0;
-              }),
+              onChanged: (v) => setState(() => _sort = v),
             ),
             const SizedBox(height: 12),
             _label('BRAND'),
             _BrandDropdown(
               options: _brandsInScope,
               value: _brandFilter,
-              onChanged: (v) => setState(() {
-                _brandFilter = v;
-                _selectedIndex = 0;
-              }),
+              onChanged: (v) => setState(() => _brandFilter = v),
             ),
             const SizedBox(height: 10),
             Row(
               children: [
                 Checkbox(
                   value: _inStockOnly,
-                  onChanged: (v) => setState(() {
-                    _inStockOnly = v ?? false;
-                    _selectedIndex = 0;
-                  }),
+                  onChanged: (v) =>
+                      setState(() => _inStockOnly = v ?? false),
                   visualDensity: VisualDensity.compact,
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
@@ -601,78 +440,36 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   Widget _buildRightPane() {
     // Every drill level renders a scrollable 3-column vertical grid
     // (or the product detail view). RIGHT flank rail drives vertical
-    // scroll via widget.scrollController. LEFT rail acts as a card
-    // selector: it walks _selectedIndex across the current level's
-    // tile list and opens the highlighted one on horizontal swipe.
-    late Widget pane;
+    // scroll via widget.scrollController. LEFT rail scrolls the filter
+    // panel in the summary column via widget.filterScrollController.
     switch (_level) {
-      case _Level.categories: {
-        final entries = _computeCategoryEntries();
-        _visibleCount = entries.length;
-        _selectedIndex = _selectedIndex.clamp(0, entries.length - 1 < 0 ? 0 : entries.length - 1);
-        pane = _CategoriesGrid(
-          entries: entries,
+      case _Level.categories:
+        return _CategoriesGrid(
+          products: _applyFilters(_productsInScope),
           onOpen: _drillIntoCategory,
           scrollController: widget.scrollController,
-          selectedIndex: _visibleCount > 0 ? _selectedIndex : -1,
-          selectedTileKey: _selectedTileKey,
         );
-        break;
-      }
-      case _Level.subCategories: {
-        final entries = _computeSubCategoryEntries();
-        _visibleCount = entries.length;
-        _selectedIndex = _selectedIndex.clamp(0, entries.length - 1 < 0 ? 0 : entries.length - 1);
-        pane = _SubCategoriesGrid(
+      case _Level.subCategories:
+        return _SubCategoriesGrid(
           category: _category!,
-          entries: entries,
+          products: _applyFilters(_productsInScope),
           onOpen: _drillIntoSubCategory,
           scrollController: widget.scrollController,
-          selectedIndex: _visibleCount > 0 ? _selectedIndex : -1,
-          selectedTileKey: _selectedTileKey,
         );
-        break;
-      }
-      case _Level.products: {
-        final list = _computeProductList();
-        _visibleCount = list.length;
-        _selectedIndex = _selectedIndex.clamp(0, list.length - 1 < 0 ? 0 : list.length - 1);
-        pane = _ProductsGrid(
+      case _Level.products:
+        final list = _applyFilters(_productsInScope).toList()
+          ..sort(_compareByMode);
+        return _ProductsGrid(
           products: list,
           onOpen: _drillIntoProduct,
           scrollController: widget.scrollController,
-          selectedIndex: _visibleCount > 0 ? _selectedIndex : -1,
-          selectedTileKey: _selectedTileKey,
         );
-        break;
-      }
       case _Level.productDetail:
-        _visibleCount = 0;
-        pane = _ProductDetailView(
+        return _ProductDetailView(
           product: _focusedProduct!,
           scrollController: widget.scrollController,
         );
-        break;
     }
-    _scheduleControllerSync();
-    return pane;
-  }
-
-  /// Publish current tile count / selection to the parent dashboard's
-  /// [InventorySelectionController] after the frame paints. Post-frame
-  /// keeps notifyListeners out of the middle of our own build.
-  void _scheduleControllerSync() {
-    final ctrl = widget.selectionController;
-    if (ctrl == null) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      ctrl._bind(
-        itemCount: _visibleCount,
-        selectedIndex: _selectedIndex,
-        onSelect: _handleRailSelect,
-        onOpen: _handleRailOpen,
-      );
-    });
   }
 }
 
@@ -775,26 +572,27 @@ class _DropdownFrame extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _CategoriesGrid extends StatelessWidget {
-  final List<MapEntry<String, List<Product>>> entries;
+  final Iterable<Product> products;
   final ValueChanged<String> onOpen;
   final ScrollController? scrollController;
-  final int selectedIndex;
-  final Key selectedTileKey;
   const _CategoriesGrid({
-    required this.entries,
+    required this.products,
     required this.onOpen,
-    required this.selectedIndex,
-    required this.selectedTileKey,
     this.scrollController,
   });
 
   @override
   Widget build(BuildContext context) {
+    final byCat = <String, List<Product>>{};
+    for (final p in products) {
+      byCat.putIfAbsent(p.category, () => []).add(p);
+    }
+    final entries = byCat.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
     return _CardGrid(
       scrollController: scrollController,
       itemCount: entries.length,
-      selectedIndex: selectedIndex,
-      selectedTileKey: selectedTileKey,
       builder: (ctx, i) {
         final e = entries[i];
         final preview = e.value.firstWhere(
@@ -818,27 +616,31 @@ class _CategoriesGrid extends StatelessWidget {
 
 class _SubCategoriesGrid extends StatelessWidget {
   final String category;
-  final List<MapEntry<String, List<Product>>> entries;
+  final Iterable<Product> products;
   final ValueChanged<String> onOpen;
   final ScrollController? scrollController;
-  final int selectedIndex;
-  final Key selectedTileKey;
   const _SubCategoriesGrid({
     required this.category,
-    required this.entries,
+    required this.products,
     required this.onOpen,
-    required this.selectedIndex,
-    required this.selectedTileKey,
     this.scrollController,
   });
 
   @override
   Widget build(BuildContext context) {
+    final bySub = <String, List<Product>>{};
+    for (final p in products) {
+      final sub = (p.subCategory?.trim().isNotEmpty ?? false)
+          ? p.subCategory!
+          : 'General';
+      bySub.putIfAbsent(sub, () => []).add(p);
+    }
+    final entries = bySub.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
     return _CardGrid(
       scrollController: scrollController,
       itemCount: entries.length,
-      selectedIndex: selectedIndex,
-      selectedTileKey: selectedTileKey,
       builder: (ctx, i) {
         final e = entries[i];
         final preview = e.value.firstWhere(
@@ -864,13 +666,9 @@ class _ProductsGrid extends StatelessWidget {
   final List<Product> products;
   final ValueChanged<Product> onOpen;
   final ScrollController? scrollController;
-  final int selectedIndex;
-  final Key selectedTileKey;
   const _ProductsGrid({
     required this.products,
     required this.onOpen,
-    required this.selectedIndex,
-    required this.selectedTileKey,
     this.scrollController,
   });
 
@@ -887,8 +685,6 @@ class _ProductsGrid extends StatelessWidget {
     return _CardGrid(
       scrollController: scrollController,
       itemCount: products.length,
-      selectedIndex: selectedIndex,
-      selectedTileKey: selectedTileKey,
       builder: (ctx, i) {
         final p = products[i];
         return _ProductTile(product: p, onTap: () => onOpen(p));
@@ -906,20 +702,9 @@ class _CardGrid extends StatelessWidget {
   final int itemCount;
   final Widget Function(BuildContext, int) builder;
   final ScrollController? scrollController;
-
-  /// Index of the tile currently highlighted by the left flank rail.
-  /// -1 disables the ring (e.g. no visible tiles under current filters).
-  final int selectedIndex;
-
-  /// Attached to the currently-selected tile's subtree so the state's
-  /// _handleRailSelect can call Scrollable.ensureVisible on it.
-  final Key selectedTileKey;
-
   const _CardGrid({
     required this.itemCount,
     required this.builder,
-    required this.selectedIndex,
-    required this.selectedTileKey,
     this.scrollController,
   });
 
@@ -935,33 +720,7 @@ class _CardGrid extends StatelessWidget {
         childAspectRatio: 250 / 349,
       ),
       itemCount: itemCount,
-      itemBuilder: (ctx, i) {
-        final tile = builder(ctx, i);
-        if (i != selectedIndex) return tile;
-        // Wrap the selected tile in a Stack so we can overlay the
-        // blue selection ring without insetting the tile content.
-        // KeyedSubtree pins the selectedTileKey to the tile subtree
-        // so ensureVisible can scroll to it after a rail step.
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            KeyedSubtree(key: selectedTileKey, child: tile),
-            const IgnorePointer(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.all(Radius.circular(10)),
-                  border: Border.fromBorderSide(
-                    BorderSide(
-                      color: _kInventorySelectionBlue,
-                      width: _kInventorySelectionBorderWidth,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
+      itemBuilder: builder,
     );
   }
 }
