@@ -1,0 +1,14 @@
+name: clone_pos_core
+description: Shared data models, ledger, and reservation engine for Clone-POS.
+version: 0.1.0
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  meta: ^1.11.0
+  uuid: ^4.3.3
+
+dev_dependencies:
+  test: ^1.24.0

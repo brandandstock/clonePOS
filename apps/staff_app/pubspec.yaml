@@ -1,0 +1,36 @@
+name: clone_pos_staff_app
+description: Clone-POS Staff App — Master and Satellite roles, chosen at pairing.
+version: 0.1.0
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  clone_pos_core:
+    path: ../../packages/core
+  clone_pos_widgets:
+    path: ../../packages/widgets
+  # Variable-weight Material Symbols so we can dial stroke weight down
+  # for the landing tile icons — the built-in Icons.xxx_outlined font
+  # is fixed-weight and doesn't respond to Icon.weight.
+  material_symbols_icons: ^4.2853.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  # Google Sans Flex is the canonical app font (see kClonePosFontFamily
+  # in theme/clone_pos_theme.dart). Now shipping under the SIL Open Font
+  # License (see assets/fonts/OFL.txt). One variable-font file covers
+  # every weight the app uses — Flutter interpolates via TextStyle's
+  # fontWeight, so no per-weight registration is needed.
+  fonts:
+    - family: Google Sans Flex
+      fonts:
+        - asset: assets/fonts/GoogleSansFlex-VariableFont.ttf
