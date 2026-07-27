@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:clone_pos_core/models/product.dart';
 import '../data/seed_products_cybergic_500.dart';
+import 'master_dashboard_screen.dart' show AppTheme;
 
 /// Inventory dashboard for the opened-state template. Fills the
 /// tile-grid + summary-column area with two panes; `settingsMode`
@@ -253,9 +254,10 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   /// "INVENTORY" by default, "SETTINGS" when settingsMode is on.
   Widget _buildTitleCell() {
     final title = widget.settingsMode ? 'SETTINGS' : 'INVENTORY';
+    final t = AppTheme.of(context);
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: const Color(0xFFD9D9D9),
+        color: t.panelBg,
         borderRadius: BorderRadius.circular(10),
       ),
       child: Padding(
@@ -264,8 +266,8 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
           alignment: Alignment.centerLeft,
           child: Text(
             title,
-            style: const TextStyle(
-              color: Color(0xFF2E2E2E),
+            style: TextStyle(
+              color: t.panelText,
               fontSize: 26,
               fontWeight: FontWeight.w500,
               letterSpacing: 3,
@@ -282,8 +284,9 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
     // so the LEFT flank rail (via widget.filterScrollController) can
     // scroll it when the field list grows or the pane shrinks.
     final title = widget.settingsMode ? 'SETTINGS' : 'INVENTORY';
+    final t = AppTheme.of(context);
     return Material(
-      color: const Color(0xFFD9D9D9),
+      color: t.panelBg,
       borderRadius: BorderRadius.circular(10),
       child: SingleChildScrollView(
         controller: widget.filterScrollController,
@@ -293,15 +296,15 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
           children: [
             Text(
               title,
-              style: const TextStyle(
-                color: Color(0xFF2E2E2E),
+              style: TextStyle(
+                color: t.panelText,
                 fontSize: 20,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 1,
               ),
             ),
             const SizedBox(height: 6),
-            Container(height: 2, width: 100, color: const Color(0xFF2E2E2E)),
+            Container(height: 2, width: 100, color: t.panelAccent),
             const SizedBox(height: 16),
             _breadcrumb(),
             const SizedBox(height: 16),
@@ -685,6 +688,10 @@ class _ProductsGrid extends StatelessWidget {
     return _CardGrid(
       scrollController: scrollController,
       itemCount: products.length,
+      // Products drill uses 5 cols per client — fits ~15 tiles on
+      // screen with vertical scroll for the rest.
+      crossAxisCount: 5,
+      childAspectRatio: 149 / 232,
       builder: (ctx, i) {
         final p = products[i];
         return _ProductTile(product: p, onTap: () => onOpen(p));
@@ -694,18 +701,23 @@ class _ProductsGrid extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Shared 3-column vertical card grid + tile widgets. RIGHT flank rail
-// drives the vertical scroll via its ScrollController.
+// Shared vertical card grid — defaults to 3 columns (categories +
+// sub-categories); the products drill overrides to 5. RIGHT flank
+// rail drives the vertical scroll via its ScrollController.
 // ---------------------------------------------------------------------------
 
 class _CardGrid extends StatelessWidget {
   final int itemCount;
   final Widget Function(BuildContext, int) builder;
   final ScrollController? scrollController;
+  final int crossAxisCount;
+  final double childAspectRatio;
   const _CardGrid({
     required this.itemCount,
     required this.builder,
     this.scrollController,
+    this.crossAxisCount = 3,
+    this.childAspectRatio = 250 / 349,
   });
 
   @override
@@ -713,11 +725,11 @@ class _CardGrid extends StatelessWidget {
     return GridView.builder(
       controller: scrollController,
       padding: const EdgeInsets.symmetric(vertical: 2),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: crossAxisCount,
         mainAxisSpacing: 2,
         crossAxisSpacing: 2,
-        childAspectRatio: 250 / 349,
+        childAspectRatio: childAspectRatio,
       ),
       itemCount: itemCount,
       itemBuilder: builder,
@@ -740,8 +752,9 @@ class _BrowseTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
     return Material(
-      color: const Color(0xFFD9D9D9),
+      color: t.panelBg,
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
@@ -755,7 +768,7 @@ class _BrowseTile extends StatelessWidget {
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: Container(
-                    color: const Color(0xFFEDEDED),
+                    color: t.chipBg,
                     alignment: Alignment.center,
                     child: (imageUrl ?? '').isNotEmpty
                         ? Image.network(
@@ -767,16 +780,16 @@ class _BrowseTile extends StatelessWidget {
                             cacheWidth: 200,
                             filterQuality: FilterQuality.low,
                             gaplessPlayback: true,
-                            errorBuilder: (_, __, ___) => const Icon(
+                            errorBuilder: (_, __, ___) => Icon(
                               Icons.inventory_2_outlined,
                               size: 48,
-                              color: Color(0xFF888888),
+                              color: t.cardSubtleText,
                             ),
                           )
-                        : const Icon(
+                        : Icon(
                             Icons.inventory_2_outlined,
                             size: 48,
-                            color: Color(0xFF888888),
+                            color: t.cardSubtleText,
                           ),
                   ),
                 ),
@@ -786,8 +799,8 @@ class _BrowseTile extends StatelessWidget {
                 title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Color(0xFF2E2E2E),
+                style: TextStyle(
+                  color: t.panelText,
                   fontWeight: FontWeight.w700,
                   fontSize: 14,
                 ),
@@ -795,8 +808,8 @@ class _BrowseTile extends StatelessWidget {
               const SizedBox(height: 2),
               Text(
                 subtitle,
-                style: const TextStyle(
-                  color: Color(0xFF666666),
+                style: TextStyle(
+                  color: t.cardSubtleText,
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
                 ),
@@ -818,8 +831,9 @@ class _ProductTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final stock = product.stock ?? 0;
     final hasBrand = (product.brand ?? '').isNotEmpty;
+    final t = AppTheme.of(context);
     return Material(
-      color: const Color(0xFFD9D9D9),
+      color: t.panelBg,
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
@@ -833,7 +847,7 @@ class _ProductTile extends StatelessWidget {
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: Container(
-                    color: const Color(0xFFEDEDED),
+                    color: t.chipBg,
                     alignment: Alignment.center,
                     child: (product.imageUrl ?? '').isNotEmpty
                         ? Image.network(
@@ -842,16 +856,16 @@ class _ProductTile extends StatelessWidget {
                             cacheWidth: 200,
                             filterQuality: FilterQuality.low,
                             gaplessPlayback: true,
-                            errorBuilder: (_, __, ___) => const Icon(
+                            errorBuilder: (_, __, ___) => Icon(
                               Icons.image_not_supported_outlined,
                               size: 40,
-                              color: Color(0xFF888888),
+                              color: t.cardSubtleText,
                             ),
                           )
-                        : const Icon(
+                        : Icon(
                             Icons.image_not_supported_outlined,
                             size: 40,
-                            color: Color(0xFF888888),
+                            color: t.cardSubtleText,
                           ),
                   ),
                 ),
@@ -861,8 +875,8 @@ class _ProductTile extends StatelessWidget {
                 product.name,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Color(0xFF2E2E2E),
+                style: TextStyle(
+                  color: t.panelText,
                   fontWeight: FontWeight.w700,
                   fontSize: 12,
                   height: 1.15,
@@ -874,8 +888,8 @@ class _ProductTile extends StatelessWidget {
                   product.brand!,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Color(0xFF666666),
+                  style: TextStyle(
+                    color: t.cardSubtleText,
                     fontSize: 10,
                     fontWeight: FontWeight.w600,
                     letterSpacing: 0.4,
