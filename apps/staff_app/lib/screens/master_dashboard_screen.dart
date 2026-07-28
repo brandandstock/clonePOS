@@ -315,7 +315,11 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
                     ),
 
                     // Invisible flank gesture zones — LANDING ONLY.
-                    // Vertical drag → step selection; horizontal → open.
+                    // Vertical drag → step selection. Swipe-to-open
+                    // was removed: it fired too easily on partial
+                    // horizontal drift during a scroll gesture, so
+                    // the rail is now scroll-only on landing. Tiles
+                    // are still tap-to-open.
                     if (!_isOpened) ...[
                       Positioned(
                         left: _railLeftX - _railTouchPad,
@@ -328,7 +332,6 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
                           selectedIndex: _selectedIndex,
                           showVisual: false,
                           onSelected: _selectTile,
-                          onSwipeOpen: _openTile,
                         ),
                       ),
                       Positioned(
@@ -342,7 +345,6 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
                           selectedIndex: _selectedIndex,
                           showVisual: false,
                           onSelected: _selectTile,
-                          onSwipeOpen: _openTile,
                         ),
                       ),
                     ],

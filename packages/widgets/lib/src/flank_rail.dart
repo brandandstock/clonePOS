@@ -205,15 +205,18 @@ class _FlankRailState extends State<FlankRail> {
   /// drives lists that can be tens of thousands of dp long, so a raw
   /// 1:1 mapping barely moves the list. Instead we treat the rail as
   /// a scrollbar thumb: dragging the rail's full height covers the
-  /// full scrollable extent. `maxScroll / panelHeight` gives the
-  /// exact scale factor. A tiny floor prevents divide-by-zero when
-  /// LayoutBuilder hasn't reported a height yet (shouldn't happen in
-  /// practice, but cheap to guard).
-  double _railScrollRatio(ScrollPosition pos) {
+  /// full scrollable extent — CAPPED so ultra-long lists don't
+  /// translate 1 dp of finger to 60+ dp of content, which reads as
+  /// jumpy on the tablet. The cap keeps browsing calm; a flick still
+  /// covers ground because the fling uses the unclamped ratio.
+  static const double _dragRatioMax = 12;
+  static const double _dragRatioMin = 1;
+  double _railScrollRatio(ScrollPosition pos, {bool clamp = false}) {
     if (_panelHeight <= 0) return 1;
     final max = pos.maxScrollExtent;
     if (max <= 0) return 1;
-    return max / _panelHeight;
+    final raw = max / _panelHeight;
+    return clamp ? raw.clamp(_dragRatioMin, _dragRatioMax) : raw;
   }
 
   void _handlePanUpdate(DragUpdateDetails d, double panelHeight) {
@@ -225,11 +228,11 @@ class _FlankRailState extends State<FlankRail> {
     if (controller != null) {
       if (!controller.hasClients) return;
       final pos = controller.position;
-      final ratio = _railScrollRatio(pos);
+      final ratio = _railScrollRatio(pos, clamp: true);
       // Finger UP (dy < 0)  → offset increases (reveal more below).
       // Finger DOWN (dy > 0) → offset decreases (return to top).
-      // Multiply by the rail:content ratio so a full-rail drag covers
-      // the full scrollable range, just like a scrollbar thumb.
+      // Clamped ratio keeps deliberate drag calm on long lists;
+      // fling on release still uses the raw scrollbar-thumb ratio.
       final next = (pos.pixels - d.delta.dy * ratio)
           .clamp(pos.minScrollExtent, pos.maxScrollExtent);
       controller.jumpTo(next);
@@ -260,28 +263,35 @@ class _FlankRailState extends State<FlankRail> {
 
   void _handlePanEnd(DragEndDetails d) {
     // Scroll-controller mode — apply a fling from the finger's exit
-    // velocity. Same rail:content ratio as drag so a flick throws the
-    // list a proportional distance, then decelerates.
+    // velocity. Uses the raw (unclamped) rail:content ratio so a
+    // hard flick covers real distance even on the longest lists.
+    // Duration scales with target distance so a light flick decays
+    // quickly and a big throw stays smooth to the end.
     final controller = widget.scrollController;
     if (controller != null) {
       if (controller.hasClients) {
         final vy = d.velocity.pixelsPerSecond.dy;
-        // Ignore weak lifts — anything under this is a stationary
-        // release, not a flick, and shouldn't spin the list.
-        if (vy.abs() > 120) {
+        // Ignore weak lifts — under this it's a stationary release,
+        // not a flick, and shouldn't spin the list.
+        if (vy.abs() > 80) {
           final pos = controller.position;
           final ratio = _railScrollRatio(pos);
-          // 0.18 = roughly how many seconds of continued motion a
-          // flick "buys" you before deceleration. Feels natural
-          // matched with the 420ms easeOutCubic curve below.
-          final flingDist = -vy * ratio * 0.18;
+          // 0.22 = seconds of continued motion a flick "buys" before
+          // deceleration. Slightly longer than a straight physics
+          // integral so releases feel unhurried and elegant.
+          final flingDist = -vy * ratio * 0.22;
           final target = (pos.pixels + flingDist)
               .clamp(pos.minScrollExtent, pos.maxScrollExtent);
-          if ((target - pos.pixels).abs() > 1) {
+          final travel = (target - pos.pixels).abs();
+          if (travel > 1) {
+            // 0.6 ms per dp, clamped to a sane range: a 100 dp
+            // nudge lands in ~250 ms; a 3000 dp throw takes ~900 ms
+            // and stays smooth all the way down.
+            final ms = (travel * 0.6).clamp(220.0, 900.0).round();
             pos.animateTo(
               target,
-              duration: const Duration(milliseconds: 420),
-              curve: Curves.easeOutCubic,
+              duration: Duration(milliseconds: ms),
+              curve: Curves.easeOutQuint,
             );
           }
         }
@@ -377,9 +387,7 @@ class _RailVisual extends StatelessWidget {
                 ),
               ),
             ),
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 120),
-              curve: Curves.easeOut,
+            Positioned(
               top: dotTop,
               right: side == RailSide.left ? -dotSize / 2 : null,
               left: side == RailSide.right ? -dotSize / 2 : null,
