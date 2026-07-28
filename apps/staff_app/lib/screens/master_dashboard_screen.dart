@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
@@ -106,6 +108,164 @@ class MenuTile {
   final String label;
   final IconData icon;
   const MenuTile({required this.label, required this.icon});
+}
+
+// ── Animation kit (client spec: 250 ms) ─────────────────────────────
+// Entrance/transition system distilled from the reference site
+// (styles.refero.design ORYZO extraction). Every animation runs at
+// the instructed 250 ms; staggers are 40 ms per element.
+
+/// Editorial reveal — fades a child in while rising 14 px. 250 ms,
+/// easeOutCubic, with a caller-supplied stagger delay. Plays once per
+/// insertion into the tree, so grids replay it naturally whenever a
+/// tab or sub-detail (re)opens.
+class _Reveal extends StatefulWidget {
+  final Widget child;
+  final int delayMs;
+  const _Reveal({required this.child, this.delayMs = 0});
+
+  @override
+  State<_Reveal> createState() => _RevealState();
+}
+
+class _RevealState extends State<_Reveal>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 250),
+  );
+  late final CurvedAnimation _a =
+      CurvedAnimation(parent: _c, curve: Curves.easeOutCubic);
+  Timer? _delay;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.delayMs <= 0) {
+      _c.forward();
+    } else {
+      _delay = Timer(Duration(milliseconds: widget.delayMs), () {
+        if (mounted) _c.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _delay?.cancel();
+    _a.dispose();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _a,
+      // child is built once; only the transform/opacity update per frame.
+      child: widget.child,
+      builder: (_, child) => Opacity(
+        opacity: _a.value,
+        child: Transform.translate(
+          offset: Offset(0, 14 * (1 - _a.value)),
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+/// Masked headline reveal — the text rises out of an invisible clip,
+/// the editorial signature entrance for display type. Nothing fades;
+/// the letterforms slide up from behind the mask. 250 ms.
+class _MaskedReveal extends StatefulWidget {
+  final Widget child;
+  final int delayMs;
+  const _MaskedReveal({required this.child, this.delayMs = 0});
+
+  @override
+  State<_MaskedReveal> createState() => _MaskedRevealState();
+}
+
+class _MaskedRevealState extends State<_MaskedReveal>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 250),
+  );
+  late final CurvedAnimation _a =
+      CurvedAnimation(parent: _c, curve: Curves.easeOutCubic);
+  Timer? _delay;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.delayMs <= 0) {
+      _c.forward();
+    } else {
+      _delay = Timer(Duration(milliseconds: widget.delayMs), () {
+        if (mounted) _c.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _delay?.cancel();
+    _a.dispose();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRect(
+      child: AnimatedBuilder(
+        animation: _a,
+        child: widget.child,
+        builder: (_, child) => FractionalTranslation(
+          translation: Offset(0, 1 - _a.value),
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+/// The "lone object floating" idle loop from the reference site — a
+/// slow ±5 px sine drift on the product image, ~3.6 s per cycle.
+class _VoidFloat extends StatefulWidget {
+  final Widget child;
+  const _VoidFloat({required this.child});
+
+  @override
+  State<_VoidFloat> createState() => _VoidFloatState();
+}
+
+class _VoidFloatState extends State<_VoidFloat>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 3600),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _c,
+      child: widget.child,
+      builder: (_, child) => Transform.translate(
+        offset: Offset(0, 5 * math.sin(_c.value * 2 * math.pi)),
+        child: child,
+      ),
+    );
+  }
 }
 
 class MasterDashboardScreen extends StatefulWidget {
@@ -592,13 +752,16 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
           top: y,
           width: _oTileW,
           height: _oTileH,
-          child: labels != null
-              ? _LabelledTile(
-                  label: labels[labelIdx],
-                  onTap: () =>
-                      setState(() => _openSubIndex = labelIdx + 1),
-                )
-              : const _BlankTile(),
+          child: _Reveal(
+            delayMs: labelIdx * 40,
+            child: labels != null
+                ? _LabelledTile(
+                    label: labels[labelIdx],
+                    onTap: () =>
+                        setState(() => _openSubIndex = labelIdx + 1),
+                  )
+                : const _BlankTile(),
+          ),
         ));
       }
     }
@@ -622,10 +785,15 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         top: y,
         width: _tileW,
         height: _tileH,
-        child: _MenuTileCell(
-          tile: _tiles[i],
-          selected: i == _selectedIndex,
-          onTap: () => _openTile(i),
+        // 40 ms stagger left-to-right, top-to-bottom. Plays on first
+        // build and whenever landing remounts.
+        child: _Reveal(
+          delayMs: i * 40,
+          child: _MenuTileCell(
+            tile: _tiles[i],
+            selected: i == _selectedIndex,
+            onTap: () => _openTile(i),
+          ),
         ),
       ));
     }
@@ -870,13 +1038,14 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
 
     return Stack(
       children: [
-        // Col 1 top: customer header pill.
+        // Col 1 top: customer header pill. Staggered 250 ms reveals
+        // sweep the bento left-to-right on open.
         Positioned(
           left: 0,
           top: 0,
           width: w,
           height: headerH,
-          child: _CustomerHeaderPill(cart: _cart),
+          child: _Reveal(child: _CustomerHeaderPill(cart: _cart)),
         ),
         // Col 1 bottom: selected item detail (blue border when a row
         // is picked from the stack).
@@ -885,7 +1054,10 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: headerH + g,
           width: w,
           height: detailH,
-          child: _SelectedItemCell(line: _cart.lines[_selectedLine]),
+          child: _Reveal(
+            delayMs: 40,
+            child: _SelectedItemCell(line: _cart.lines[_selectedLine]),
+          ),
         ),
 
         // Cols 2-3: item-list bento (top header strip + vertical stack).
@@ -894,10 +1066,13 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: 0,
           width: w * 2 + g,
           height: h * 2 + g,
-          child: _ItemListBento(
-            cart: _cart,
-            selectedIndex: _selectedLine,
-            onSelect: (i) => setState(() => _selectedLine = i),
+          child: _Reveal(
+            delayMs: 80,
+            child: _ItemListBento(
+              cart: _cart,
+              selectedIndex: _selectedLine,
+              onSelect: (i) => setState(() => _selectedLine = i),
+            ),
           ),
         ),
 
@@ -907,14 +1082,14 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: 0,
           width: w,
           height: h,
-          child: _summaryTile(),
+          child: _Reveal(delayMs: 120, child: _summaryTile()),
         ),
         Positioned(
           left: (w + g) * 3,
           top: h + g,
           width: w,
           height: h,
-          child: _checkoutTile(),
+          child: _Reveal(delayMs: 160, child: _checkoutTile()),
         ),
       ],
     );
@@ -1066,16 +1241,20 @@ class _CustomerHeaderPill extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(
-              cart.customerName,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: t.panelText,
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-                letterSpacing: -0.3,
-                height: 1.1,
+            _MaskedReveal(
+              // Rises just after the pill's own reveal settles.
+              delayMs: 80,
+              child: Text(
+                cart.customerName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: t.panelText,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.3,
+                  height: 1.1,
+                ),
               ),
             ),
             const SizedBox(height: 4),
@@ -1116,29 +1295,48 @@ class _SelectedItemCell extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Big product image — takes ~half the cell height.
+            // Big product image — takes ~half the cell height. The
+            // museum-artifact treatment from the reference site: a
+            // slow float loop plus a 250 ms fade+scale swap when a
+            // different row is selected.
             AspectRatio(
               aspectRatio: 1,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Container(
-                  color: t.chipBg,
-                  alignment: Alignment.center,
-                  child: (p.imageUrl ?? '').isNotEmpty
-                      ? Image.network(
-                          p.imageUrl!,
-                          fit: BoxFit.contain,
-                          errorBuilder: (_, __, ___) => Icon(
-                            Symbols.image_not_supported,
-                            color: t.cardSubtleText,
-                            size: 36,
-                          ),
-                        )
-                      : Icon(
-                          Symbols.image_not_supported,
-                          color: t.cardSubtleText,
-                          size: 36,
-                        ),
+              child: _VoidFloat(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeIn,
+                  transitionBuilder: (child, anim) => FadeTransition(
+                    opacity: anim,
+                    child: ScaleTransition(
+                      scale: Tween<double>(begin: 0.96, end: 1)
+                          .animate(anim),
+                      child: child,
+                    ),
+                  ),
+                  child: ClipRRect(
+                    key: ValueKey(p.id),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      color: t.chipBg,
+                      alignment: Alignment.center,
+                      child: (p.imageUrl ?? '').isNotEmpty
+                          ? Image.network(
+                              p.imageUrl!,
+                              fit: BoxFit.contain,
+                              errorBuilder: (_, __, ___) => Icon(
+                                Symbols.image_not_supported,
+                                color: t.cardSubtleText,
+                                size: 36,
+                              ),
+                            )
+                          : Icon(
+                              Symbols.image_not_supported,
+                              color: t.cardSubtleText,
+                              size: 36,
+                            ),
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1312,10 +1510,13 @@ class _ItemListBento extends StatelessWidget {
             padding: EdgeInsets.zero,
             itemCount: cart.lines.length,
             separatorBuilder: (_, __) => const SizedBox(height: gap),
-            itemBuilder: (ctx, i) => _ItemRow(
-              line: cart.lines[i],
-              selected: i == selectedIndex,
-              onTap: () => onSelect(i),
+            itemBuilder: (ctx, i) => _Reveal(
+              delayMs: i * 40,
+              child: _ItemRow(
+                line: cart.lines[i],
+                selected: i == selectedIndex,
+                onTap: () => onSelect(i),
+              ),
             ),
           ),
         ),
@@ -1742,13 +1943,17 @@ class _FeatureFilterColumn extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 20),
         child: Align(
           alignment: Alignment.centerLeft,
-          child: Text(
-            title.toUpperCase(),
-            style: TextStyle(
-              color: t.panelText,
-              fontSize: 24,
-              fontWeight: FontWeight.w500,
-              letterSpacing: 3,
+          // Display headline rises out of its clip on tab open — the
+          // masked editorial entrance.
+          child: _MaskedReveal(
+            child: Text(
+              title.toUpperCase(),
+              style: TextStyle(
+                color: t.panelText,
+                fontSize: 24,
+                fontWeight: FontWeight.w500,
+                letterSpacing: 3,
+              ),
             ),
           ),
         ),
