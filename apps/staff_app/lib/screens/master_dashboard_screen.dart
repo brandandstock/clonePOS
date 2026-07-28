@@ -2,6 +2,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
+import '../data/active_cart.dart';
 import 'inventory_opened_view.dart';
 import 'sales_kit_opened_view.dart';
 
@@ -397,7 +398,10 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
                         width: _oCentralEndX - _oCentralStartX,
                         height: _oTileH * 2 + _oGridGap,
                         child: _tiles[_openedIndex!].label == 'Carts'
-                            ? _CartDetailPanel(cartName: _subDetailTitle())
+                            ? _CartDetailPanel(
+                                cartName: _subDetailTitle(),
+                                cartIndex: _openSubIndex!,
+                              )
                             : _SubDetailPanel(title: _subDetailTitle()),
                       ),
 
@@ -499,7 +503,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               ),
             ),
           ),
-      ] else ...[
+      ] else if (_openSubIndex == null) ...[
         // Col 1 — filter column, same 250×702 chrome as Inventory's
         // summary column. Static placeholder for now; each tab can
         // wire its own fields later.
@@ -512,6 +516,11 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         ),
         // Cols 2-4 — 3×2 sub-detail tile grid, or 2×2 when Settings
         // is on to leave col 4 for the panel.
+        //
+        // Skipped when a sub-detail panel is up: the sub-detail's
+        // Stack children would otherwise composite on top of the
+        // labelled tiles (visible bleed under empty cells in the
+        // Cart bento — session-10 fix).
         ..._buildOpenedTileGrid(openedLabel),
         if (_settingsPanelOn)
           Positioned(
@@ -816,31 +825,83 @@ class _LabelledTile extends StatelessWidget {
 // Text-only placeholders for now — wire real state per section later.
 // ---------------------------------------------------------------------------
 
-class _CartDetailPanel extends StatelessWidget {
+/// Session-10 rewrite: the middle two columns of the cart detail now
+/// render a **bento** — one tall "selected item" cell on the left and a
+/// vertical stack of item rows filling the rest. Col-1 also grows a small
+/// header pill above the tall cell showing customer/id at a glance.
+/// The right-most column (summary + checkout) is untouched per client.
+class _CartDetailPanel extends StatefulWidget {
   final String cartName;
-  const _CartDetailPanel({required this.cartName});
+  final int cartIndex; // 1..6 — maps to seedActiveCarts()[cartIndex-1]
+  const _CartDetailPanel({
+    required this.cartName,
+    required this.cartIndex,
+  });
+
+  @override
+  State<_CartDetailPanel> createState() => _CartDetailPanelState();
+}
+
+class _CartDetailPanelState extends State<_CartDetailPanel> {
+  // Cache the deterministic seed once. seedActiveCarts() runs an RNG
+  // pass over 300 seed products — keep it out of the build.
+  static final List<ActiveCart> _cartsCache = seedActiveCarts();
+
+  int _selectedLine = 0;
+
+  ActiveCart get _cart {
+    // cartIndex 1..6 → clamp into seed range so we never crash if the
+    // sub-index model grows past the seed length.
+    final i = (widget.cartIndex - 1).clamp(0, _cartsCache.length - 1);
+    return _cartsCache[i];
+  }
 
   @override
   Widget build(BuildContext context) {
     const w = _oTileW; // 250
     const h = _oTileH; // 350
     const g = _oGridGap; // 2
+
+    // Column-1 split: a short header pill at the top, then the tall
+    // selected-item cell fills the remainder. 90 lines up with the
+    // header strip inside cols 2-3 so the two columns share a baseline.
+    const headerH = 90.0;
+    const detailH = h * 2 + g - headerH - g;
+
     return Stack(
       children: [
+        // Col 1 top: customer header pill.
         Positioned(
           left: 0,
           top: 0,
           width: w,
-          height: h * 2 + g,
-          child: _cartFilterCol(),
+          height: headerH,
+          child: _CustomerHeaderPill(cart: _cart),
         ),
+        // Col 1 bottom: selected item detail (blue border when a row
+        // is picked from the stack).
+        Positioned(
+          left: 0,
+          top: headerH + g,
+          width: w,
+          height: detailH,
+          child: _SelectedItemCell(line: _cart.lines[_selectedLine]),
+        ),
+
+        // Cols 2-3: item-list bento (top header strip + vertical stack).
         Positioned(
           left: w + g,
           top: 0,
           width: w * 2 + g,
           height: h * 2 + g,
-          child: _cartItemsPanel(),
+          child: _ItemListBento(
+            cart: _cart,
+            selectedIndex: _selectedLine,
+            onSelect: (i) => setState(() => _selectedLine = i),
+          ),
         ),
+
+        // Col 4: summary + checkout — UNCHANGED per client sign-off.
         Positioned(
           left: (w + g) * 3,
           top: 0,
@@ -857,138 +918,6 @@ class _CartDetailPanel extends StatelessWidget {
         ),
       ],
     );
-  }
-
-  Widget _cartFilterCol() {
-    return Builder(builder: (context) {
-      final t = AppTheme.of(context);
-      return DecoratedBox(
-        decoration: BoxDecoration(
-          color: t.panelBg,
-          borderRadius: BorderRadius.circular(_tileRadius),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                cartName.toUpperCase(),
-                style: TextStyle(
-                  color: t.panelText,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Container(height: 2, width: 100, color: t.panelAccent),
-              const SizedBox(height: 20),
-              _cartFilterField(t, 'CUSTOMER', 'Walk-in'),
-              const SizedBox(height: 14),
-              _cartFilterField(t, 'DISCOUNT', 'None'),
-              const SizedBox(height: 14),
-              _cartFilterField(t, 'COUPON', 'Apply code'),
-              const SizedBox(height: 14),
-              _cartFilterField(t, 'PAYMENT', 'Cash / UPI / Card'),
-              const SizedBox(height: 14),
-              _cartFilterField(t, 'NOTES', 'Add note'),
-            ],
-          ),
-        ),
-      );
-    });
-  }
-
-  static Widget _cartFilterField(AppTheme t, String label, String hint) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(bottom: 6),
-          child: Text(
-            label,
-            style: TextStyle(
-              color: t.cardSubtleText,
-              fontSize: 10,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 1.4,
-            ),
-          ),
-        ),
-        Container(
-          height: 34,
-          alignment: Alignment.centerLeft,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: t.fieldBg,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(
-            hint,
-            style: TextStyle(
-              color: t.fieldHint,
-              fontSize: 13,
-              fontWeight: FontWeight.w400,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _cartItemsPanel() {
-    return Builder(builder: (context) {
-      final t = AppTheme.of(context);
-      return Material(
-        color: t.cardBg,
-        borderRadius: BorderRadius.circular(_tileRadius),
-        clipBehavior: Clip.antiAlias,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(28, 24, 28, 24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                '$cartName — Items',
-                style: TextStyle(
-                  color: t.cardText,
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.5,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                'Line items in this cart. Scan or tap "Add product" to '
-                'add. Swipe a row to remove, tap the qty to edit.',
-                style: TextStyle(
-                  color: t.cardSubtleText,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w400,
-                  height: 1.35,
-                ),
-              ),
-              const SizedBox(height: 18),
-              Divider(color: t.divider, height: 1),
-              Expanded(
-                child: Center(
-                  child: Text(
-                    'Cart is empty',
-                    style: TextStyle(
-                      color: t.cardSubtleText,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w500,
-                      letterSpacing: 0.4,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    });
   }
 
   Widget _summaryTile() {
@@ -1106,6 +1035,412 @@ class _CartDetailPanel extends StatelessWidget {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cart-detail bento pieces (session 10).
+//   [_CustomerHeaderPill] — small panel above the tall selected-item cell.
+//   [_SelectedItemCell]   — tall left cell showing the currently focused
+//                           line item; blue border while a row is picked.
+//   [_ItemListBento]      — cols 2-3: header strip + vertical stack of
+//                           bento rows, one per cart line.
+// ---------------------------------------------------------------------------
+
+const Color _kSelectionBlue = Color(0xFF3AA0FF);
+
+class _CustomerHeaderPill extends StatelessWidget {
+  final ActiveCart cart;
+  const _CustomerHeaderPill({required this.cart});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: t.panelBg,
+        borderRadius: BorderRadius.circular(_tileRadius),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              cart.customerName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: t.panelText,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+                letterSpacing: -0.3,
+                height: 1.1,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${cart.id}  ·  Sat ${cart.satelliteNumber}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: t.cardSubtleText,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SelectedItemCell extends StatelessWidget {
+  final CartLine line;
+  const _SelectedItemCell({required this.line});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    final p = line.product;
+    return Container(
+      decoration: BoxDecoration(
+        color: t.cardBg,
+        borderRadius: BorderRadius.circular(_tileRadius),
+        border: Border.all(color: _kSelectionBlue, width: 2),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Big product image — takes ~half the cell height.
+            AspectRatio(
+              aspectRatio: 1,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  color: t.chipBg,
+                  alignment: Alignment.center,
+                  child: (p.imageUrl ?? '').isNotEmpty
+                      ? Image.network(
+                          p.imageUrl!,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => Icon(
+                            Symbols.image_not_supported,
+                            color: t.cardSubtleText,
+                            size: 36,
+                          ),
+                        )
+                      : Icon(
+                          Symbols.image_not_supported,
+                          color: t.cardSubtleText,
+                          size: 36,
+                        ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              p.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: t.cardText,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                height: 1.15,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              p.brand ?? '—',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: t.cardSubtleText,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const Spacer(),
+            // Qty + unit price.
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: t.chipBg,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    'Qty ${line.quantity}',
+                    style: TextStyle(
+                      color: t.cardText,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.4,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  '₹${_formatMoney(p.price)}',
+                  style: TextStyle(
+                    color: t.cardSubtleText,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '₹${_formatMoney(line.subtotal)}',
+              style: TextStyle(
+                color: t.cardText,
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -0.4,
+                height: 1,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ItemListBento extends StatelessWidget {
+  final ActiveCart cart;
+  final int selectedIndex;
+  final ValueChanged<int> onSelect;
+  const _ItemListBento({
+    required this.cart,
+    required this.selectedIndex,
+    required this.onSelect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    const headerH = 90.0;
+    const gap = 2.0;
+
+    return Column(
+      children: [
+        // Header strip — item count + total items pill. Baseline
+        // matches the customer header on col 1.
+        SizedBox(
+          height: headerH,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: t.cardBg,
+              borderRadius: BorderRadius.circular(_tileRadius),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+              child: Row(
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        'ITEMS',
+                        style: TextStyle(
+                          color: t.cardSubtleText,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 1.6,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '${cart.lines.length} lines · '
+                        '${cart.itemCount} qty',
+                        style: TextStyle(
+                          color: t.cardText,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: t.chipBg,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Symbols.add,
+                            size: 16,
+                            color: t.cardText,
+                            weight: 500),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Add product',
+                          style: TextStyle(
+                            color: t.cardText,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: gap),
+        // Vertical stack of item rows. ListView so long carts scroll —
+        // eventually attaches to the right rail's vertical controller.
+        Expanded(
+          child: ListView.separated(
+            padding: EdgeInsets.zero,
+            itemCount: cart.lines.length,
+            separatorBuilder: (_, __) => const SizedBox(height: gap),
+            itemBuilder: (ctx, i) => _ItemRow(
+              line: cart.lines[i],
+              selected: i == selectedIndex,
+              onTap: () => onSelect(i),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ItemRow extends StatelessWidget {
+  final CartLine line;
+  final bool selected;
+  final VoidCallback onTap;
+  const _ItemRow({
+    required this.line,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    final p = line.product;
+    return Material(
+      color: t.cardBg,
+      borderRadius: BorderRadius.circular(_tileRadius),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(_tileRadius),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(_tileRadius),
+            border: Border.all(
+              color: selected ? _kSelectionBlue : Colors.transparent,
+              width: 2,
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(14, 12, 18, 12),
+          child: Row(
+            children: [
+              // Thumbnail.
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  width: 56,
+                  height: 56,
+                  color: t.chipBg,
+                  alignment: Alignment.center,
+                  child: (p.imageUrl ?? '').isNotEmpty
+                      ? Image.network(
+                          p.imageUrl!,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => Icon(
+                            Symbols.image_not_supported,
+                            color: t.cardSubtleText,
+                            size: 22,
+                          ),
+                        )
+                      : Icon(
+                          Symbols.image_not_supported,
+                          color: t.cardSubtleText,
+                          size: 22,
+                        ),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      p.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: t.cardText,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        height: 1.1,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${p.brand ?? '—'} · ₹${_formatMoney(p.price)} × '
+                      '${line.quantity}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: t.cardSubtleText,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                '₹${_formatMoney(line.subtotal)}',
+                style: TextStyle(
+                  color: t.cardText,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Local Indian-grouping money formatter — matches the format used in
+// active_carts_view.dart's cart tiles.
+String _formatMoney(double n) {
+  final s = n.toStringAsFixed(0);
+  final b = StringBuffer();
+  final chars = s.split('').reversed.toList();
+  for (var i = 0; i < chars.length; i++) {
+    b.write(chars[i]);
+    final atGroup = i == 2 || (i > 2 && (i - 2) % 2 == 0);
+    if (atGroup && i != chars.length - 1) b.write(',');
+  }
+  return b.toString().split('').reversed.join();
 }
 
 // ---------------------------------------------------------------------------
