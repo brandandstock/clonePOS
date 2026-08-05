@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
@@ -108,6 +110,164 @@ class MenuTile {
   const MenuTile({required this.label, required this.icon});
 }
 
+// ── Animation kit (client spec: 250 ms) ─────────────────────────────
+// Entrance/transition system distilled from the reference site
+// (styles.refero.design ORYZO extraction). Every animation runs at
+// the instructed 250 ms; staggers are 40 ms per element.
+
+/// Editorial reveal — fades a child in while rising 14 px. 250 ms,
+/// easeOutCubic, with a caller-supplied stagger delay. Plays once per
+/// insertion into the tree, so grids replay it naturally whenever a
+/// tab or sub-detail (re)opens.
+class _Reveal extends StatefulWidget {
+  final Widget child;
+  final int delayMs;
+  const _Reveal({required this.child, this.delayMs = 0});
+
+  @override
+  State<_Reveal> createState() => _RevealState();
+}
+
+class _RevealState extends State<_Reveal>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 250),
+  );
+  late final CurvedAnimation _a =
+      CurvedAnimation(parent: _c, curve: Curves.easeOutCubic);
+  Timer? _delay;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.delayMs <= 0) {
+      _c.forward();
+    } else {
+      _delay = Timer(Duration(milliseconds: widget.delayMs), () {
+        if (mounted) _c.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _delay?.cancel();
+    _a.dispose();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _a,
+      // child is built once; only the transform/opacity update per frame.
+      child: widget.child,
+      builder: (_, child) => Opacity(
+        opacity: _a.value,
+        child: Transform.translate(
+          offset: Offset(0, 14 * (1 - _a.value)),
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+/// Masked headline reveal — the text rises out of an invisible clip,
+/// the editorial signature entrance for display type. Nothing fades;
+/// the letterforms slide up from behind the mask. 250 ms.
+class _MaskedReveal extends StatefulWidget {
+  final Widget child;
+  final int delayMs;
+  const _MaskedReveal({required this.child, this.delayMs = 0});
+
+  @override
+  State<_MaskedReveal> createState() => _MaskedRevealState();
+}
+
+class _MaskedRevealState extends State<_MaskedReveal>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 250),
+  );
+  late final CurvedAnimation _a =
+      CurvedAnimation(parent: _c, curve: Curves.easeOutCubic);
+  Timer? _delay;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.delayMs <= 0) {
+      _c.forward();
+    } else {
+      _delay = Timer(Duration(milliseconds: widget.delayMs), () {
+        if (mounted) _c.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _delay?.cancel();
+    _a.dispose();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRect(
+      child: AnimatedBuilder(
+        animation: _a,
+        child: widget.child,
+        builder: (_, child) => FractionalTranslation(
+          translation: Offset(0, 1 - _a.value),
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+/// The "lone object floating" idle loop from the reference site — a
+/// slow ±5 px sine drift on the product image, ~3.6 s per cycle.
+class _VoidFloat extends StatefulWidget {
+  final Widget child;
+  const _VoidFloat({required this.child});
+
+  @override
+  State<_VoidFloat> createState() => _VoidFloatState();
+}
+
+class _VoidFloatState extends State<_VoidFloat>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 3600),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _c,
+      child: widget.child,
+      builder: (_, child) => Transform.translate(
+        offset: Offset(0, 5 * math.sin(_c.value * 2 * math.pi)),
+        child: child,
+      ),
+    );
+  }
+}
+
 class MasterDashboardScreen extends StatefulWidget {
   const MasterDashboardScreen({super.key});
 
@@ -123,6 +283,10 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   /// tab (1..8). null = the tab is on its landing grid; non-null = the
   /// in-place sub-detail panel is shown covering the whole tile grid.
   int? _openSubIndex;
+
+  /// Which clone card (0..5) is currently selected on the Clones
+  /// overview — draws the blue focus border. null = none selected.
+  int? _selectedClone;
 
   /// Settings panel — theme / chime / language / logout, rendered
   /// inline as the tall right-column panel (250×702). Toggled by the
@@ -159,7 +323,67 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   void dispose() {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
+    _cloneTicker?.cancel();
     super.dispose();
+  }
+
+  // ── Clone fleet call state ─────────────────────────────────────────
+  // Shared source of truth so the SESSIONS master control and each
+  // individual clone card drive the SAME live/timer state:
+  //   - master CALL  → every clone connects (all cards go live)
+  //   - master END   → every clone disconnects
+  //   - a card's CALL/CUT toggles just that one clone, independently
+  // A single ticker advances every live clone's clock once a second.
+  static const int _cloneCount = 6;
+  final List<bool> _cloneLive = List<bool>.filled(_cloneCount, false);
+  final List<int> _cloneElapsed = List<int>.filled(_cloneCount, 0);
+  Timer? _cloneTicker;
+
+  bool get _anyCloneLive => _cloneLive.any((e) => e);
+
+  void _syncCloneTicker() {
+    if (_anyCloneLive && _cloneTicker == null) {
+      _cloneTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        setState(() {
+          for (var i = 0; i < _cloneCount; i++) {
+            if (_cloneLive[i]) _cloneElapsed[i]++;
+          }
+        });
+      });
+    } else if (!_anyCloneLive && _cloneTicker != null) {
+      _cloneTicker!.cancel();
+      _cloneTicker = null;
+    }
+  }
+
+  void _toggleClone(int i) {
+    setState(() {
+      _cloneLive[i] = !_cloneLive[i];
+      _cloneElapsed[i] = 0;
+      _selectedClone = i; // calling/cutting a clone focuses its card
+    });
+    _syncCloneTicker();
+  }
+
+  void _callAllClones() {
+    setState(() {
+      for (var i = 0; i < _cloneCount; i++) {
+        _cloneLive[i] = true;
+        _cloneElapsed[i] = 0;
+      }
+    });
+    _syncCloneTicker();
+  }
+
+  void _cutAllClones() {
+    setState(() {
+      for (var i = 0; i < _cloneCount; i++) {
+        _cloneLive[i] = false;
+        _cloneElapsed[i] = 0;
+      }
+    });
+    _syncCloneTicker();
   }
 
   // Placeholder metrics — wire to real repositories later.
@@ -512,7 +736,18 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
           top: _oGridStartY,
           width: _oTileW,
           height: _oTileH * 2 + _oGridGap,
-          child: _FeatureFilterColumn(title: openedLabel),
+          // Clones docks a live SESSIONS console under its filters —
+          // the fleet-wide CALL/END control lives on the overview, not
+          // on each clone's detail page.
+          child: openedLabel == 'Clones'
+              ? _ClonesFilterColumn(
+                  live: _cloneLive,
+                  elapsed: _cloneElapsed,
+                  anyLive: _anyCloneLive,
+                  onCallAll: _callAllClones,
+                  onCutAll: _cutAllClones,
+                )
+              : _FeatureFilterColumn(title: openedLabel),
         ),
         // Cols 2-4 — 3×2 sub-detail tile grid, or 2×2 when Settings
         // is on to leave col 4 for the panel.
@@ -587,18 +822,36 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         final x = _oGridStartX + gridCol * (_oTileW + _oGridGap);
         final y = _oGridStartY + row * (_oTileH + _oGridGap);
         final labelIdx = row * 3 + innerCol;
+        final Widget cell;
+        if (openedLabel == 'Clones') {
+          // Clone tiles are live call cards, not drill-in tiles. Their
+          // live/timer state is owned by the parent so the SESSIONS
+          // master control and the card share one source of truth.
+          final id = _cloneIdentities[labelIdx % _cloneIdentities.length];
+          cell = _CloneCard(
+            number: labelIdx + 1,
+            name: id.$1,
+            subtitle: id.$2,
+            live: _cloneLive[labelIdx],
+            elapsedSeconds: _cloneElapsed[labelIdx],
+            onToggle: () => _toggleClone(labelIdx),
+            selected: _selectedClone == labelIdx,
+            onSelect: () => setState(() => _selectedClone = labelIdx),
+          );
+        } else if (labels != null) {
+          cell = _LabelledTile(
+            label: labels[labelIdx],
+            onTap: () => setState(() => _openSubIndex = labelIdx + 1),
+          );
+        } else {
+          cell = const _BlankTile();
+        }
         widgets.add(Positioned(
           left: x,
           top: y,
           width: _oTileW,
           height: _oTileH,
-          child: labels != null
-              ? _LabelledTile(
-                  label: labels[labelIdx],
-                  onTap: () =>
-                      setState(() => _openSubIndex = labelIdx + 1),
-                )
-              : const _BlankTile(),
+          child: _Reveal(delayMs: labelIdx * 40, child: cell),
         ));
       }
     }
@@ -622,10 +875,15 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         top: y,
         width: _tileW,
         height: _tileH,
-        child: _MenuTileCell(
-          tile: _tiles[i],
-          selected: i == _selectedIndex,
-          onTap: () => _openTile(i),
+        // 40 ms stagger left-to-right, top-to-bottom. Plays on first
+        // build and whenever landing remounts.
+        child: _Reveal(
+          delayMs: i * 40,
+          child: _MenuTileCell(
+            tile: _tiles[i],
+            selected: i == _selectedIndex,
+            onTap: () => _openTile(i),
+          ),
         ),
       ));
     }
@@ -870,13 +1128,14 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
 
     return Stack(
       children: [
-        // Col 1 top: customer header pill.
+        // Col 1 top: customer header pill. Staggered 250 ms reveals
+        // sweep the bento left-to-right on open.
         Positioned(
           left: 0,
           top: 0,
           width: w,
           height: headerH,
-          child: _CustomerHeaderPill(cart: _cart),
+          child: _Reveal(child: _CustomerHeaderPill(cart: _cart)),
         ),
         // Col 1 bottom: selected item detail (blue border when a row
         // is picked from the stack).
@@ -885,7 +1144,10 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: headerH + g,
           width: w,
           height: detailH,
-          child: _SelectedItemCell(line: _cart.lines[_selectedLine]),
+          child: _Reveal(
+            delayMs: 40,
+            child: _SelectedItemCell(line: _cart.lines[_selectedLine]),
+          ),
         ),
 
         // Cols 2-3: item-list bento (top header strip + vertical stack).
@@ -894,10 +1156,13 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: 0,
           width: w * 2 + g,
           height: h * 2 + g,
-          child: _ItemListBento(
-            cart: _cart,
-            selectedIndex: _selectedLine,
-            onSelect: (i) => setState(() => _selectedLine = i),
+          child: _Reveal(
+            delayMs: 80,
+            child: _ItemListBento(
+              cart: _cart,
+              selectedIndex: _selectedLine,
+              onSelect: (i) => setState(() => _selectedLine = i),
+            ),
           ),
         ),
 
@@ -907,14 +1172,14 @@ class _CartDetailPanelState extends State<_CartDetailPanel> {
           top: 0,
           width: w,
           height: h,
-          child: _summaryTile(),
+          child: _Reveal(delayMs: 120, child: _summaryTile()),
         ),
         Positioned(
           left: (w + g) * 3,
           top: h + g,
           width: w,
           height: h,
-          child: _checkoutTile(),
+          child: _Reveal(delayMs: 160, child: _checkoutTile()),
         ),
       ],
     );
@@ -1066,16 +1331,20 @@ class _CustomerHeaderPill extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(
-              cart.customerName,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: t.panelText,
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-                letterSpacing: -0.3,
-                height: 1.1,
+            _MaskedReveal(
+              // Rises just after the pill's own reveal settles.
+              delayMs: 80,
+              child: Text(
+                cart.customerName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: t.panelText,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.3,
+                  height: 1.1,
+                ),
               ),
             ),
             const SizedBox(height: 4),
@@ -1116,29 +1385,48 @@ class _SelectedItemCell extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Big product image — takes ~half the cell height.
+            // Big product image — takes ~half the cell height. The
+            // museum-artifact treatment from the reference site: a
+            // slow float loop plus a 250 ms fade+scale swap when a
+            // different row is selected.
             AspectRatio(
               aspectRatio: 1,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Container(
-                  color: t.chipBg,
-                  alignment: Alignment.center,
-                  child: (p.imageUrl ?? '').isNotEmpty
-                      ? Image.network(
-                          p.imageUrl!,
-                          fit: BoxFit.contain,
-                          errorBuilder: (_, __, ___) => Icon(
-                            Symbols.image_not_supported,
-                            color: t.cardSubtleText,
-                            size: 36,
-                          ),
-                        )
-                      : Icon(
-                          Symbols.image_not_supported,
-                          color: t.cardSubtleText,
-                          size: 36,
-                        ),
+              child: _VoidFloat(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeIn,
+                  transitionBuilder: (child, anim) => FadeTransition(
+                    opacity: anim,
+                    child: ScaleTransition(
+                      scale: Tween<double>(begin: 0.96, end: 1)
+                          .animate(anim),
+                      child: child,
+                    ),
+                  ),
+                  child: ClipRRect(
+                    key: ValueKey(p.id),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      color: t.chipBg,
+                      alignment: Alignment.center,
+                      child: (p.imageUrl ?? '').isNotEmpty
+                          ? Image.network(
+                              p.imageUrl!,
+                              fit: BoxFit.contain,
+                              errorBuilder: (_, __, ___) => Icon(
+                                Symbols.image_not_supported,
+                                color: t.cardSubtleText,
+                                size: 36,
+                              ),
+                            )
+                          : Icon(
+                              Symbols.image_not_supported,
+                              color: t.cardSubtleText,
+                              size: 36,
+                            ),
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1312,10 +1600,13 @@ class _ItemListBento extends StatelessWidget {
             padding: EdgeInsets.zero,
             itemCount: cart.lines.length,
             separatorBuilder: (_, __) => const SizedBox(height: gap),
-            itemBuilder: (ctx, i) => _ItemRow(
-              line: cart.lines[i],
-              selected: i == selectedIndex,
-              onTap: () => onSelect(i),
+            itemBuilder: (ctx, i) => _Reveal(
+              delayMs: i * 40,
+              child: _ItemRow(
+                line: cart.lines[i],
+                selected: i == selectedIndex,
+                onTap: () => onSelect(i),
+              ),
             ),
           ),
         ),
@@ -1479,6 +1770,446 @@ class _SubDetailPanel extends StatelessWidget {
           ),
           const Expanded(child: SizedBox()),
         ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clones filter column — the Clones tab replaces the generic feature
+// filter column with this one: the same CLONES / SEARCH / SORT / STATUS
+// / DATE chrome, plus a live SESSIONS console docked beneath the filters.
+//
+// SESSIONS is the fleet-wide call console (it lives on the Clones
+// overview, not on each clone's detail page):
+//   - Idle  → every session reads 00:00, all dots grey, green CALL.
+//   - Tap CALL → the fleet is dialled: connected clones' clocks start
+//     ticking and their dots light green; the button flips to a red END.
+//     Tap END → everything resets back to idle.
+// Figma: SESSIONS component on the Clone feature page (Version-ONE).
+// ---------------------------------------------------------------------------
+
+// Clone-feature palette — sampled straight from the Version-ONE Figma.
+const Color _oCallGreen = Color(0xFF00C700); // CALL button / live clocks
+const Color _oCallRed = Color(0xFFA80B0B); // SESSIONS master END — deep red
+const Color _oCloneLiveBg = Color(0xFFF4C75D); // live card — mustard yellow
+const Color _oCloneOrange = Color(0xFFFB8F00); // badge numeral
+const Color _oCutRed = Color(0xFFF64900); // card CUT button — orange-red
+const Color _oCloneCardBg = Color(0xFFD9D9D9); // idle card — fixed light grey
+const Color _oCloneCardText = Color(0xFF63605B); // card name/sub/time (both states)
+
+// Placeholder clone identities — name + posting. Wire to real fleet
+// records later; cycles if the grid ever grows past six.
+const List<(String, String)> _cloneIdentities = [
+  ('Staff', 'Department'),
+  ('Ronaldo', 'Soccer Isle'),
+  ('Mia', 'Cosmetics'),
+  ('Dev', 'Electronics'),
+  ('Aisha', 'Grocery'),
+  ('Leo', 'Home & Living'),
+];
+
+// ---------------------------------------------------------------------------
+// Clone call card — one per clone tile on the Clones overview grid.
+//   Idle → grey card, green CALL, clock parked at 00:00.
+//   Live → mustard-yellow card, red CUT, clock ticking.
+// Stateless: its live/timer state is owned by the parent so the SESSIONS
+// master control ("call all") and this card stay in lockstep. Tap CALL/
+// CUT toggles just this clone; tapping the body selects it (blue border).
+// The badge is a fixed "1" on every card per client.
+// ---------------------------------------------------------------------------
+
+class _CloneCard extends StatelessWidget {
+  final int number; // badge numeral — the clone's sequence (1, 2, 3 …)
+  final String name;
+  final String subtitle;
+  final bool live;
+  final int elapsedSeconds;
+  final VoidCallback onToggle; // CALL/CUT for this one clone
+  final bool selected;
+  final VoidCallback onSelect;
+  const _CloneCard({
+    required this.number,
+    required this.name,
+    required this.subtitle,
+    required this.live,
+    required this.elapsedSeconds,
+    required this.onToggle,
+    required this.selected,
+    required this.onSelect,
+  });
+
+  String _fmt(int s) =>
+      '${(s ~/ 60).toString().padLeft(2, '0')}:${(s % 60).toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    // Fixed Figma colours (the card is a client-locked design element, so
+    // it stays light grey / mustard in both app themes to match the mock).
+    // Absolute-positioned to the exact Figma offsets on the 250×350 tile.
+    return GestureDetector(
+      onTap: onSelect,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOutCubic,
+        decoration: BoxDecoration(
+          color: live ? _oCloneLiveBg : _oCloneCardBg,
+          borderRadius: BorderRadius.circular(10),
+          border: selected
+              ? Border.all(
+                  color: _selectionBlue, width: _selectionBorderWidth)
+              : null,
+        ),
+        child: Stack(
+          children: [
+            // Badge — the clone's sequence number, 96px Bold, centred near
+            // the top.
+            Positioned(
+              top: -2,
+              left: 0,
+              right: 0,
+              child: Text(
+                '$number',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: _oCloneOrange,
+                  fontSize: 96,
+                  fontWeight: FontWeight.w700,
+                  height: 1.0042,
+                  letterSpacing: -3.84,
+                ),
+              ),
+            ),
+            // Name — 36px Light.
+            Positioned(
+              top: 94,
+              left: 8,
+              right: 8,
+              child: Text(
+                name,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: _oCloneCardText,
+                  fontSize: 36,
+                  fontWeight: FontWeight.w300,
+                  height: 1.0042,
+                  letterSpacing: -1.44,
+                ),
+              ),
+            ),
+            // Subtitle — 20px Regular.
+            Positioned(
+              top: 128,
+              left: 8,
+              right: 8,
+              child: Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: _oCloneCardText,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w400,
+                  height: 1.0042,
+                  letterSpacing: -1.2,
+                ),
+              ),
+            ),
+            // CALL / CUT button — 60×60, centred at y≈238.
+            Positioned(
+              top: 208,
+              left: 0,
+              right: 0,
+              child: Center(child: _callButton()),
+            ),
+            // Clock — 13px Regular.
+            Positioned(
+              top: 285,
+              left: 8,
+              right: 8,
+              child: Text(
+                live ? _fmt(elapsedSeconds) : '00:00',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: _oCloneCardText,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w400,
+                  height: 1.0042,
+                  letterSpacing: 0.91,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _callButton() {
+    final color = live ? _oCutRed : _oCallGreen;
+    return Material(
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 3,
+      shadowColor: color.withValues(alpha: 0.5),
+      child: InkWell(
+        onTap: onToggle,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 60,
+          height: 60,
+          child: Center(
+            child: Text(
+              live ? 'CUT' : 'CALL',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w400,
+                letterSpacing: 4,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ClonesFilterColumn extends StatelessWidget {
+  final List<bool> live;
+  final List<int> elapsed;
+  final bool anyLive;
+  final VoidCallback onCallAll;
+  final VoidCallback onCutAll;
+  const _ClonesFilterColumn({
+    required this.live,
+    required this.elapsed,
+    required this.anyLive,
+    required this.onCallAll,
+    required this.onCutAll,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(height: 115, child: _titleCell(t)),
+        const SizedBox(height: 2),
+        Expanded(child: _bodyCell(t)),
+      ],
+    );
+  }
+
+  Widget _titleCell(AppTheme t) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: t.panelBg,
+        borderRadius: BorderRadius.circular(_tileRadius),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        child: Align(
+          // Centred per client design update — the CLONES title above
+          // the SESSIONS tab is centred, not left-aligned.
+          alignment: Alignment.center,
+          child: _MaskedReveal(
+            child: Text(
+              'CLONES',
+              style: TextStyle(
+                color: t.panelText,
+                fontSize: 28,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 4.48,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // The SESSIONS console owns the whole cell — filters removed per
+  // client. FittedBox scales the console to the panel height so the
+  // CALL button is always on-screen: it must fit in one view, no scroll.
+  Widget _bodyCell(AppTheme t) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: t.panelBg,
+        borderRadius: BorderRadius.circular(_tileRadius),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: SizedBox(
+            width: 210,
+            child: _CloneSessionsConsole(
+              live: live,
+              elapsed: elapsed,
+              anyLive: anyLive,
+              onCallAll: onCallAll,
+              onCutAll: onCutAll,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Compact SESSIONS console tuned for the ~210px-wide filter column:
+// heading, a live clock per clone, connection dots, and the fleet
+// master CALL/END control. Stateless — the parent owns the shared
+// live/elapsed state; the master button dials or cuts EVERY clone at
+// once, and each row mirrors whatever state its clone is currently in
+// (whether that came from the master or the card's own CALL/CUT).
+class _CloneSessionsConsole extends StatelessWidget {
+  final List<bool> live;
+  final List<int> elapsed;
+  final bool anyLive;
+  final VoidCallback onCallAll;
+  final VoidCallback onCutAll;
+  const _CloneSessionsConsole({
+    required this.live,
+    required this.elapsed,
+    required this.anyLive,
+    required this.onCallAll,
+    required this.onCutAll,
+  });
+
+  String _fmt(int totalSeconds) {
+    final m = totalSeconds ~/ 60;
+    final s = totalSeconds % 60;
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Center(
+          child: Text(
+            'SESSIONS',
+            style: TextStyle(
+              color: t.panelText,
+              fontSize: 24,
+              fontWeight: FontWeight.w500,
+              letterSpacing: 3.84,
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        for (var i = 0; i < live.length; i++) _sessionRow(t, i),
+        const SizedBox(height: 14),
+        // Connection dots — one per clone; green while that clone is live.
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            for (var i = 0; i < live.length; i++)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: _dot(t, on: live[i]),
+              ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        Center(child: _callButton()),
+        const SizedBox(height: 8),
+        Text(
+          'ALL\nCLONES',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: t.cardSubtleText,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 3,
+            height: 1.3,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // Stacked clock — clone label above its running time, centred, like
+  // the Figma mock. The whole column belongs to SESSIONS now that the
+  // filters are gone, so the rows can breathe.
+  Widget _sessionRow(AppTheme t, int i) {
+    final on = live[i];
+    final seconds = on ? elapsed[i] : 0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        children: [
+          Text(
+            'CLONE :0${i + 1}',
+            style: TextStyle(
+              color: t.panelText,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 2.4,
+            ),
+          ),
+          Text(
+            _fmt(seconds),
+            style: TextStyle(
+              // Live clocks read in the fleet green; parked clocks stay
+              // in Figma's black-80% so the row still reads when idle.
+              color: on ? _oCallGreen : t.panelText,
+              fontSize: 24,
+              fontWeight: FontWeight.w300,
+              letterSpacing: 0.48,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _dot(AppTheme t, {required bool on}) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOutCubic,
+      width: 11,
+      height: 11,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: on ? _oCallGreen : t.divider,
+      ),
+    );
+  }
+
+  Widget _callButton() {
+    final color = anyLive ? _oCallRed : _oCallGreen;
+    return Material(
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 4,
+      shadowColor: color.withValues(alpha: 0.5),
+      child: InkWell(
+        onTap: anyLive ? onCutAll : onCallAll,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 60,
+          height: 60,
+          child: Center(
+            child: Text(
+              anyLive ? 'END' : 'CALL',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w400,
+                letterSpacing: 4,
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1742,13 +2473,17 @@ class _FeatureFilterColumn extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 20),
         child: Align(
           alignment: Alignment.centerLeft,
-          child: Text(
-            title.toUpperCase(),
-            style: TextStyle(
-              color: t.panelText,
-              fontSize: 24,
-              fontWeight: FontWeight.w500,
-              letterSpacing: 3,
+          // Display headline rises out of its clip on tab open — the
+          // masked editorial entrance.
+          child: _MaskedReveal(
+            child: Text(
+              title.toUpperCase(),
+              style: TextStyle(
+                color: t.panelText,
+                fontSize: 24,
+                fontWeight: FontWeight.w500,
+                letterSpacing: 3,
+              ),
             ),
           ),
         ),
