@@ -54,7 +54,10 @@ class CatalogImporter {
     if (text.isNotEmpty && text.codeUnitAt(0) == 0xFEFF) {
       text = text.substring(1);
     }
-    final rows = const CsvToListConverter(shouldParseNumbers: false)
+    // Normalise line endings: the csv package defaults to \r\n only, so a
+    // Unix (\n) or old-Mac (\r) file would otherwise parse as a single row.
+    text = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false)
         .convert(text);
     if (rows.isEmpty) {
       return const ImportReport(fatal: 'The file is empty.');
@@ -66,6 +69,7 @@ class CatalogImporter {
     final issues = <String>[];
     for (var r = 1; r < rows.length; r++) {
       final cells = rows[r].map((c) => c == null ? '' : '$c').toList();
+      if (cells.every((c) => c.trim().isEmpty)) continue; // skip blank lines
       final res = _rowToProduct(header, cells, r + 1);
       if (res.product != null) {
         products.add(res.product!);

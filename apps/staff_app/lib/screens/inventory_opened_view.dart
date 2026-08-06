@@ -235,6 +235,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   }
 
   Future<void> _openAddProduct() async {
+    if (_loading) return; // catalog still loading — _load() would overwrite it
     // Resolve the theme here — the context under this State is a descendant
     // of the AppTheme InheritedWidget, but the dialog route's own context is
     // not, so AppTheme.of() would fail inside the dialog. Pass it in instead.
@@ -274,6 +275,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   // ----- Bulk import (CSV / XLSX) -----------------------------------------
 
   Future<void> _openImport() async {
+    if (_loading) return; // catalog still loading — _load() would overwrite it
     final theme = AppTheme.of(context);
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -283,7 +285,11 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
     if (picked == null || picked.files.isEmpty) return; // cancelled
     final file = picked.files.first;
     final bytes = file.bytes;
-    final ext = (file.extension ?? '').toLowerCase();
+    // file_picker can return a null extension for some Android content URIs —
+    // fall back to the name's suffix so a valid .csv/.xlsx isn't rejected.
+    final ext = (file.extension ??
+            (file.name.contains('.') ? file.name.split('.').last : ''))
+        .toLowerCase();
     if (bytes == null) {
       if (!mounted) return;
       _showImportResult(theme, fatal: 'Could not read the selected file.');
@@ -717,7 +723,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
               child: FilledButton.icon(
                 icon: const Icon(Icons.add, size: 18),
                 label: const Text('Add product'),
-                onPressed: _openAddProduct,
+                onPressed: _loading ? null : _openAddProduct,
                 style: FilledButton.styleFrom(
                   backgroundColor: const Color(0xFFE87722),
                   foregroundColor: Colors.white,
@@ -731,7 +737,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.upload_file, size: 16),
                 label: const Text('Import spreadsheet'),
-                onPressed: _openImport,
+                onPressed: _loading ? null : _openImport,
                 style: OutlinedButton.styleFrom(
                   foregroundColor: const Color(0xFFE87722),
                   side: const BorderSide(color: Color(0xFFE87722)),
@@ -1776,6 +1782,14 @@ class _AddProductDialogState extends State<_AddProductDialog> {
   Uint8List? _pickedBytes;
   String? _error;
 
+  // Guards against stacking multiple discard prompts if the barrier is
+  // tapped repeatedly while the warning is already up.
+  bool _discardPromptOpen = false;
+
+  // True while the photo picker is open — a second tap would throw
+  // image_picker's "already_active" error, so we ignore re-entry.
+  bool _picking = false;
+
   @override
   void dispose() {
     _name.dispose();
@@ -1802,7 +1816,16 @@ class _AddProductDialogState extends State<_AddProductDialog> {
   }
 
   Future<void> _pickImage() async {
+    if (_picking) return;
+    _picking = true;
     try {
+      // A form text field usually still holds keyboard focus when this is
+      // tapped. Launching the photo picker while the soft keyboard is
+      // mid-animation makes the picker flicker and fail to open on MIUI, so
+      // drop focus and let the keyboard finish hiding first.
+      FocusManager.instance.primaryFocus?.unfocus();
+      await Future.delayed(const Duration(milliseconds: 200));
+      if (!mounted) return;
       final file = await _picker.pickImage(
         source: ImageSource.gallery,
         maxWidth: 1024,
@@ -1816,6 +1839,8 @@ class _AddProductDialogState extends State<_AddProductDialog> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = 'Could not load image: $e');
+    } finally {
+      _picking = false;
     }
   }
 
@@ -1834,7 +1859,7 @@ class _AddProductDialogState extends State<_AddProductDialog> {
     final specs = _specs.text.trim();
     final img = _imageUrl.text.trim();
     final stock = int.tryParse(_stock.text.trim());
-    final id = 'USR-${DateTime.now().millisecondsSinceEpoch}';
+    final id = 'USR-${DateTime.now().microsecondsSinceEpoch}';
     Navigator.of(context).pop(
       Product(
         id: id,
@@ -1852,13 +1877,69 @@ class _AddProductDialogState extends State<_AddProductDialog> {
     );
   }
 
+  /// Shown when the form is dismissed by an accidental outside-tap or the
+  /// system back button (not the explicit Cancel/Add buttons). "Continue"
+  /// keeps the form exactly as-is with all entered data; "Exit" discards it
+  /// and closes without saving.
+  Future<void> _confirmDiscard() async {
+    if (_discardPromptOpen) return;
+    _discardPromptOpen = true;
+    final t = widget.theme;
+    final exit = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.panelBg,
+        title: Text(
+          'Discard new product?',
+          style: TextStyle(
+            color: t.panelText,
+            fontSize: 18,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        content: Text(
+          'Your entered details will be lost if you exit.\n'
+          'Continue editing, or exit without saving?',
+          style: TextStyle(color: t.panelText, fontSize: 14, height: 1.35),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false), // keep editing
+            style: TextButton.styleFrom(foregroundColor: t.panelText),
+            child: const Text('Continue'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true), // discard + close
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFC62828),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Exit'),
+          ),
+        ],
+      ),
+    );
+    _discardPromptOpen = false;
+    if (exit == true && mounted) {
+      Navigator.of(context).pop(); // close the add form, returning no product
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = widget.theme;
-    return AlertDialog(
-      backgroundColor: t.panelBg,
-      title: Text(
-        'Add product',
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        // Barrier tap or system back tried to close the form — intercept and
+        // confirm instead of silently losing what's been typed.
+        if (!didPop) _confirmDiscard();
+      },
+      child: AlertDialog(
+        backgroundColor: t.panelBg,
+        title: Text(
+          'Add product',
         style: TextStyle(
           color: t.panelText,
           fontSize: 20,
@@ -1969,6 +2050,7 @@ class _AddProductDialogState extends State<_AddProductDialog> {
           child: const Text('Add'),
         ),
       ],
+      ),
     );
   }
 
