@@ -5,8 +5,11 @@ import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
+import '../comm/walkie_service.dart';
 import '../data/active_cart.dart';
+import '../data/clone_fleet_store.dart';
 import 'inventory_opened_view.dart';
+import 'walkie_dialog.dart';
 import 'sales_kit_opened_view.dart';
 
 /// ============================================================================
@@ -321,81 +324,159 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
       GlobalKey<SalesKitOpenedViewState>();
 
   @override
+  void initState() {
+    super.initState();
+    _loadFleet(); // restore any previously-online clones
+  }
+
+  @override
   void dispose() {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
     _cloneTicker?.cancel();
+    for (final t in _connectTimers) {
+      t?.cancel();
+    }
     for (final n in _cloneElapsed) {
       n.dispose();
     }
+    _walkie?.dispose();
     super.dispose();
   }
 
-  // ── Clone fleet call state ─────────────────────────────────────────
-  // Shared source of truth so the SESSIONS master control and each
-  // individual clone card drive the SAME live/timer state:
-  //   - master CALL  → every clone connects (all cards go live)
-  //   - master END   → every clone disconnects
-  //   - a card's CALL/CUT toggles just that one clone, independently
-  // A single ticker advances every live clone's clock once a second.
+  // ── Clone fleet state (simulated Satellite sessions) ───────────────
+  // Shared source of truth so the SESSIONS master control and each clone
+  // card drive the SAME state:
+  //   - CALL a clone  → offline → connecting (~1s) → online (clock ticks)
+  //   - CUT a clone   → back to offline, clock reset
+  //   - master CALL   → dials every offline clone (staggered so they land
+  //                     one after another, like real devices joining)
+  //   - master END    → disconnects the whole fleet
+  // The state is persisted (CloneFleetStore) so online clones resume on the
+  // next launch. A single ticker advances every ONLINE clone's clock once a
+  // second via per-clone ValueNotifiers, so only the two timer labels
+  // rebuild — never the whole dashboard (that was the app-wide lag).
   static const int _cloneCount = 6;
-  final List<bool> _cloneLive = List<bool>.filled(_cloneCount, false);
-  // Each clone's running-call seconds. A ValueNotifier per clone so the
-  // once-a-second tick rebuilds ONLY the two timer labels that read it
-  // (the card clock + the SESSIONS row) via ValueListenableBuilder —
-  // never the whole dashboard. A blanket setState here re-composited the
-  // full-screen mesh backdrop and all 500 inventory tiles every second,
-  // even from other tabs, which was the app-wide lag.
+  // Real LAN walkie-talkie (created lazily so the mic isn't requested until
+  // the user opens the walkie panel).
+  WalkieService? _walkie;
+  final CloneFleetStore _fleetStore = CloneFleetStore();
+  final List<_CloneStatus> _cloneStatus =
+      List<_CloneStatus>.filled(_cloneCount, _CloneStatus.offline);
   final List<ValueNotifier<int>> _cloneElapsed = List<ValueNotifier<int>>
       .generate(_cloneCount, (_) => ValueNotifier<int>(0));
+  // Per-clone connecting→online timers (the dialling delay).
+  final List<Timer?> _connectTimers = List<Timer?>.filled(_cloneCount, null);
   Timer? _cloneTicker;
 
-  bool get _anyCloneLive => _cloneLive.any((e) => e);
+  bool _isOnline(int i) => _cloneStatus[i] == _CloneStatus.online;
+  bool get _anyOnline => _cloneStatus.any((s) => s == _CloneStatus.online);
+  // Any clone not fully parked → the master button reads END.
+  bool get _anyActive =>
+      _cloneStatus.any((s) => s != _CloneStatus.offline);
+
+  Future<void> _loadFleet() async {
+    final snap = await _fleetStore.load(_cloneCount);
+    if (snap == null || !mounted) return;
+    setState(() {
+      for (var i = 0; i < _cloneCount; i++) {
+        _cloneStatus[i] =
+            snap.online[i] ? _CloneStatus.online : _CloneStatus.offline;
+        _cloneElapsed[i].value = snap.online[i] ? snap.elapsed[i] : 0;
+      }
+    });
+    _syncCloneTicker();
+  }
+
+  void _persistFleet() {
+    _fleetStore.save(
+      [for (var i = 0; i < _cloneCount; i++) _isOnline(i)],
+      [for (final n in _cloneElapsed) n.value],
+    );
+  }
 
   void _syncCloneTicker() {
-    if (_anyCloneLive && _cloneTicker == null) {
+    if (_anyOnline && _cloneTicker == null) {
       _cloneTicker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!mounted) return;
-        // Bump each live clone's notifier — no setState. Only the bound
+        // Bump each online clone's notifier — no setState. Only the bound
         // ValueListenableBuilder timer labels rebuild; if the Clones tab
         // isn't open, nothing is listening and nothing rebuilds.
         for (var i = 0; i < _cloneCount; i++) {
-          if (_cloneLive[i]) _cloneElapsed[i].value++;
+          if (_isOnline(i)) _cloneElapsed[i].value++;
         }
       });
-    } else if (!_anyCloneLive && _cloneTicker != null) {
+    } else if (!_anyOnline && _cloneTicker != null) {
       _cloneTicker!.cancel();
       _cloneTicker = null;
     }
   }
 
+  // Start dialling clone [i]; it lands online after a short (staggered)
+  // delay so a fleet-wide CALL connects them one after another.
+  void _beginConnect(int i, {int stagger = 0}) {
+    _cloneStatus[i] = _CloneStatus.connecting;
+    _cloneElapsed[i].value = 0;
+    _connectTimers[i]?.cancel();
+    _connectTimers[i] =
+        Timer(Duration(milliseconds: 900 + stagger * 220), () {
+      if (!mounted) return;
+      setState(() => _cloneStatus[i] = _CloneStatus.online);
+      _syncCloneTicker();
+      _persistFleet();
+    });
+  }
+
+  void _disconnect(int i) {
+    _connectTimers[i]?.cancel();
+    _connectTimers[i] = null;
+    _cloneStatus[i] = _CloneStatus.offline;
+    _cloneElapsed[i].value = 0;
+  }
+
   void _toggleClone(int i) {
     setState(() {
-      _cloneLive[i] = !_cloneLive[i];
-      _cloneElapsed[i].value = 0;
       _selectedClone = i; // calling/cutting a clone focuses its card
+      if (_cloneStatus[i] == _CloneStatus.offline) {
+        _beginConnect(i);
+      } else {
+        _disconnect(i); // cancel a dial-in-progress or hang up a live one
+      }
     });
     _syncCloneTicker();
+    _persistFleet();
   }
 
   void _callAllClones() {
     setState(() {
+      var stagger = 0;
       for (var i = 0; i < _cloneCount; i++) {
-        _cloneLive[i] = true;
-        _cloneElapsed[i].value = 0;
+        if (_cloneStatus[i] == _CloneStatus.offline) {
+          _beginConnect(i, stagger: stagger++);
+        }
       }
     });
     _syncCloneTicker();
+    _persistFleet();
   }
 
   void _cutAllClones() {
     setState(() {
       for (var i = 0; i < _cloneCount; i++) {
-        _cloneLive[i] = false;
-        _cloneElapsed[i].value = 0;
+        _disconnect(i);
       }
     });
     _syncCloneTicker();
+    _persistFleet();
+  }
+
+  /// Opens the real LAN walkie-talkie panel (mic + WiFi peer voice).
+  void _openWalkie() {
+    final walkie = _walkie ??= WalkieService(name: 'Master');
+    showDialog<void>(
+      context: context,
+      builder: (_) => WalkieDialog(walkie: walkie, theme: AppTheme.of(context)),
+    );
   }
 
   // Placeholder metrics — wire to real repositories later.
@@ -753,11 +834,12 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
           // on each clone's detail page.
           child: openedLabel == 'Clones'
               ? _ClonesFilterColumn(
-                  live: _cloneLive,
+                  statuses: _cloneStatus,
                   elapsed: _cloneElapsed,
-                  anyLive: _anyCloneLive,
+                  anyActive: _anyActive,
                   onCallAll: _callAllClones,
                   onCutAll: _cutAllClones,
+                  onWalkie: _openWalkie,
                 )
               : _FeatureFilterColumn(title: openedLabel),
         ),
@@ -844,7 +926,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
             number: labelIdx + 1,
             name: id.$1,
             subtitle: id.$2,
-            live: _cloneLive[labelIdx],
+            status: _cloneStatus[labelIdx],
             elapsed: _cloneElapsed[labelIdx],
             onToggle: () => _toggleClone(labelIdx),
             selected: _selectedClone == labelIdx,
@@ -1810,6 +1892,14 @@ const Color _oCutRed = Color(0xFFF64900); // card CUT button — orange-red
 const Color _oCloneCardBg = Color(0xFFD9D9D9); // idle card — fixed light grey
 const Color _oCloneCardText = Color(0xFF63605B); // card name/sub/time (both states)
 
+// Connection lifecycle for a simulated clone (Satellite) session.
+//   offline    → parked, grey dot, green CALL, clock 00:00
+//   connecting → dialling, amber dot, red CUT, clock "Connecting…"
+//   online     → connected, green dot, red CUT, clock ticking
+enum _CloneStatus { offline, connecting, online }
+
+const Color _oCloneConnecting = Color(0xFFF4A100); // amber — connecting dot
+
 // Placeholder clone identities — name + posting. Wire to real fleet
 // records later; cycles if the grid ever grows past six.
 const List<(String, String)> _cloneIdentities = [
@@ -1835,7 +1925,7 @@ class _CloneCard extends StatelessWidget {
   final int number; // badge numeral — the clone's sequence (1, 2, 3 …)
   final String name;
   final String subtitle;
-  final bool live;
+  final _CloneStatus status;
   final ValueListenable<int> elapsed;
   final VoidCallback onToggle; // CALL/CUT for this one clone
   final bool selected;
@@ -1844,7 +1934,7 @@ class _CloneCard extends StatelessWidget {
     required this.number,
     required this.name,
     required this.subtitle,
-    required this.live,
+    required this.status,
     required this.elapsed,
     required this.onToggle,
     required this.selected,
@@ -1859,13 +1949,17 @@ class _CloneCard extends StatelessWidget {
     // Fixed Figma colours (the card is a client-locked design element, so
     // it stays light grey / mustard in both app themes to match the mock).
     // Absolute-positioned to the exact Figma offsets on the 250×350 tile.
+    final online = status == _CloneStatus.online;
+    final connecting = status == _CloneStatus.connecting;
     return GestureDetector(
       onTap: onSelect,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
         curve: Curves.easeOutCubic,
         decoration: BoxDecoration(
-          color: live ? _oCloneLiveBg : _oCloneCardBg,
+          // Card lights up (mustard) once actually connected; grey while
+          // parked or dialling.
+          color: online ? _oCloneLiveBg : _oCloneCardBg,
           borderRadius: BorderRadius.circular(10),
           border: selected
               ? Border.all(
@@ -1938,24 +2032,37 @@ class _CloneCard extends StatelessWidget {
               child: Center(child: _callButton()),
             ),
             // Clock — 13px Regular. Only this label rebuilds on the tick.
+            // Online → ticking timer; connecting → "Connecting…"; else 00:00.
             Positioned(
               top: 285,
               left: 8,
               right: 8,
-              child: ValueListenableBuilder<int>(
-                valueListenable: elapsed,
-                builder: (_, seconds, __) => Text(
-                  live ? _fmt(seconds) : '00:00',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: _oCloneCardText,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w400,
-                    height: 1.0042,
-                    letterSpacing: 0.91,
-                  ),
-                ),
-              ),
+              child: online
+                  ? ValueListenableBuilder<int>(
+                      valueListenable: elapsed,
+                      builder: (_, seconds, __) => Text(
+                        _fmt(seconds),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: _oCloneCardText,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                          height: 1.0042,
+                          letterSpacing: 0.91,
+                        ),
+                      ),
+                    )
+                  : Text(
+                      connecting ? 'Connecting…' : '00:00',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: _oCloneCardText,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w400,
+                        height: 1.0042,
+                        letterSpacing: 0.91,
+                      ),
+                    ),
             ),
           ],
         ),
@@ -1964,7 +2071,10 @@ class _CloneCard extends StatelessWidget {
   }
 
   Widget _callButton() {
-    final color = live ? _oCutRed : _oCallGreen;
+    // Offline → green CALL; connecting or online → red CUT (also cancels a
+    // dial in progress).
+    final offline = status == _CloneStatus.offline;
+    final color = offline ? _oCallGreen : _oCutRed;
     return Material(
       color: color,
       shape: const CircleBorder(),
@@ -1978,7 +2088,7 @@ class _CloneCard extends StatelessWidget {
           height: 60,
           child: Center(
             child: Text(
-              live ? 'CUT' : 'CALL',
+              offline ? 'CALL' : 'CUT',
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -1994,17 +2104,19 @@ class _CloneCard extends StatelessWidget {
 }
 
 class _ClonesFilterColumn extends StatelessWidget {
-  final List<bool> live;
+  final List<_CloneStatus> statuses;
   final List<ValueListenable<int>> elapsed;
-  final bool anyLive;
+  final bool anyActive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
+  final VoidCallback onWalkie;
   const _ClonesFilterColumn({
-    required this.live,
+    required this.statuses,
     required this.elapsed,
-    required this.anyLive,
+    required this.anyActive,
     required this.onCallAll,
     required this.onCutAll,
+    required this.onWalkie,
   });
 
   @override
@@ -2064,11 +2176,12 @@ class _ClonesFilterColumn extends StatelessWidget {
           child: SizedBox(
             width: 210,
             child: _CloneSessionsConsole(
-              live: live,
+              statuses: statuses,
               elapsed: elapsed,
-              anyLive: anyLive,
+              anyActive: anyActive,
               onCallAll: onCallAll,
               onCutAll: onCutAll,
+              onWalkie: onWalkie,
             ),
           ),
         ),
@@ -2084,17 +2197,19 @@ class _ClonesFilterColumn extends StatelessWidget {
 // once, and each row mirrors whatever state its clone is currently in
 // (whether that came from the master or the card's own CALL/CUT).
 class _CloneSessionsConsole extends StatelessWidget {
-  final List<bool> live;
+  final List<_CloneStatus> statuses;
   final List<ValueListenable<int>> elapsed;
-  final bool anyLive;
+  final bool anyActive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
+  final VoidCallback onWalkie;
   const _CloneSessionsConsole({
-    required this.live,
+    required this.statuses,
     required this.elapsed,
-    required this.anyLive,
+    required this.anyActive,
     required this.onCallAll,
     required this.onCutAll,
+    required this.onWalkie,
   });
 
   String _fmt(int totalSeconds) {
@@ -2121,16 +2236,17 @@ class _CloneSessionsConsole extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 14),
-        for (var i = 0; i < live.length; i++) _sessionRow(t, i),
+        for (var i = 0; i < statuses.length; i++) _sessionRow(t, i),
         const SizedBox(height: 14),
-        // Connection dots — one per clone; green while that clone is live.
+        // Connection dots — one per clone; green online, amber connecting,
+        // grey offline.
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            for (var i = 0; i < live.length; i++)
+            for (var i = 0; i < statuses.length; i++)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: _dot(t, on: live[i]),
+                child: _dot(t, status: statuses[i]),
               ),
           ],
         ),
@@ -2148,6 +2264,37 @@ class _CloneSessionsConsole extends StatelessWidget {
             height: 1.3,
           ),
         ),
+        const SizedBox(height: 16),
+        // Real LAN walkie-talkie (WiFi voice) — separate from the fleet
+        // call simulation above.
+        InkWell(
+          onTap: onWalkie,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE87722),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.settings_input_antenna,
+                    color: Colors.white, size: 16),
+                SizedBox(width: 8),
+                Text(
+                  'LAN WALKIE',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -2156,7 +2303,9 @@ class _CloneSessionsConsole extends StatelessWidget {
   // the Figma mock. The whole column belongs to SESSIONS now that the
   // filters are gone, so the rows can breathe.
   Widget _sessionRow(AppTheme t, int i) {
-    final on = live[i];
+    final status = statuses[i];
+    final online = status == _CloneStatus.online;
+    final connecting = status == _CloneStatus.connecting;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
@@ -2170,15 +2319,20 @@ class _CloneSessionsConsole extends StatelessWidget {
               letterSpacing: 2.4,
             ),
           ),
-          // Only this clock rebuilds on the per-second tick.
+          // Only this clock rebuilds on the per-second tick. Connecting shows
+          // a fixed-width "--:--" (amber) so the FittedBox doesn't reflow.
           ValueListenableBuilder<int>(
             valueListenable: elapsed[i],
             builder: (_, value, __) => Text(
-              _fmt(on ? value : 0),
+              connecting ? '--:--' : _fmt(online ? value : 0),
               style: TextStyle(
-                // Live clocks read in the fleet green; parked clocks stay
-                // in Figma's black-80% so the row still reads when idle.
-                color: on ? _oCallGreen : t.panelText,
+                // Online clocks read in the fleet green, connecting in amber,
+                // parked clocks stay in Figma's black-80%.
+                color: online
+                    ? _oCallGreen
+                    : connecting
+                        ? _oCloneConnecting
+                        : t.panelText,
                 fontSize: 24,
                 fontWeight: FontWeight.w300,
                 letterSpacing: 0.48,
@@ -2190,7 +2344,12 @@ class _CloneSessionsConsole extends StatelessWidget {
     );
   }
 
-  Widget _dot(AppTheme t, {required bool on}) {
+  Widget _dot(AppTheme t, {required _CloneStatus status}) {
+    final color = switch (status) {
+      _CloneStatus.online => _oCallGreen,
+      _CloneStatus.connecting => _oCloneConnecting,
+      _CloneStatus.offline => t.divider,
+    };
     return AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOutCubic,
@@ -2198,27 +2357,27 @@ class _CloneSessionsConsole extends StatelessWidget {
       height: 11,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: on ? _oCallGreen : t.divider,
+        color: color,
       ),
     );
   }
 
   Widget _callButton() {
-    final color = anyLive ? _oCallRed : _oCallGreen;
+    final color = anyActive ? _oCallRed : _oCallGreen;
     return Material(
       color: color,
       shape: const CircleBorder(),
       elevation: 4,
       shadowColor: color.withValues(alpha: 0.5),
       child: InkWell(
-        onTap: anyLive ? onCutAll : onCallAll,
+        onTap: anyActive ? onCutAll : onCallAll,
         customBorder: const CircleBorder(),
         child: SizedBox(
           width: 60,
           height: 60,
           child: Center(
             child: Text(
-              anyLive ? 'END' : 'CALL',
+              anyActive ? 'END' : 'CALL',
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 10,
