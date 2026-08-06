@@ -42,13 +42,33 @@ class ProductStore {
     }
   }
 
-  /// Overwrites the stored catalog with [products]. Fire-and-forget from the
-  /// UI after every mutation.
+  // Serialised writer: the UI calls save() fire-and-forget after every edit,
+  // so bursts (e.g. an import, or rapid deletes) must not run overlapping
+  // writeAsString calls against the same file. We keep only the latest
+  // snapshot pending and drain it with a single active writer.
+  List<Product>? _pending;
+  bool _writing = false;
+
+  /// Persists [products]. Takes an immediate snapshot so a later mutation of
+  /// the caller's list can't corrupt the in-flight encode, and coalesces
+  /// bursts into the most recent state.
   Future<void> save(List<Product> products) async {
+    _pending = List<Product>.of(products); // shallow snapshot; Products immutable
+    if (_writing) return;
+    _writing = true;
     try {
-      await _write(await _file(), products);
-    } catch (_) {
-      // Best-effort — a failed write just means this edit isn't persisted.
+      final f = await _file();
+      while (_pending != null) {
+        final batch = _pending!;
+        _pending = null;
+        try {
+          await _write(f, batch);
+        } catch (_) {
+          // Best-effort — a failed write just means this edit isn't persisted.
+        }
+      }
+    } finally {
+      _writing = false;
     }
   }
 
