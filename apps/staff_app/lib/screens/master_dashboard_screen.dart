@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
@@ -324,6 +325,9 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
     _cloneTicker?.cancel();
+    for (final n in _cloneElapsed) {
+      n.dispose();
+    }
     super.dispose();
   }
 
@@ -336,7 +340,14 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // A single ticker advances every live clone's clock once a second.
   static const int _cloneCount = 6;
   final List<bool> _cloneLive = List<bool>.filled(_cloneCount, false);
-  final List<int> _cloneElapsed = List<int>.filled(_cloneCount, 0);
+  // Each clone's running-call seconds. A ValueNotifier per clone so the
+  // once-a-second tick rebuilds ONLY the two timer labels that read it
+  // (the card clock + the SESSIONS row) via ValueListenableBuilder —
+  // never the whole dashboard. A blanket setState here re-composited the
+  // full-screen mesh backdrop and all 500 inventory tiles every second,
+  // even from other tabs, which was the app-wide lag.
+  final List<ValueNotifier<int>> _cloneElapsed = List<ValueNotifier<int>>
+      .generate(_cloneCount, (_) => ValueNotifier<int>(0));
   Timer? _cloneTicker;
 
   bool get _anyCloneLive => _cloneLive.any((e) => e);
@@ -345,11 +356,12 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     if (_anyCloneLive && _cloneTicker == null) {
       _cloneTicker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!mounted) return;
-        setState(() {
-          for (var i = 0; i < _cloneCount; i++) {
-            if (_cloneLive[i]) _cloneElapsed[i]++;
-          }
-        });
+        // Bump each live clone's notifier — no setState. Only the bound
+        // ValueListenableBuilder timer labels rebuild; if the Clones tab
+        // isn't open, nothing is listening and nothing rebuilds.
+        for (var i = 0; i < _cloneCount; i++) {
+          if (_cloneLive[i]) _cloneElapsed[i].value++;
+        }
       });
     } else if (!_anyCloneLive && _cloneTicker != null) {
       _cloneTicker!.cancel();
@@ -360,7 +372,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   void _toggleClone(int i) {
     setState(() {
       _cloneLive[i] = !_cloneLive[i];
-      _cloneElapsed[i] = 0;
+      _cloneElapsed[i].value = 0;
       _selectedClone = i; // calling/cutting a clone focuses its card
     });
     _syncCloneTicker();
@@ -370,7 +382,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     setState(() {
       for (var i = 0; i < _cloneCount; i++) {
         _cloneLive[i] = true;
-        _cloneElapsed[i] = 0;
+        _cloneElapsed[i].value = 0;
       }
     });
     _syncCloneTicker();
@@ -380,7 +392,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     setState(() {
       for (var i = 0; i < _cloneCount; i++) {
         _cloneLive[i] = false;
-        _cloneElapsed[i] = 0;
+        _cloneElapsed[i].value = 0;
       }
     });
     _syncCloneTicker();
@@ -833,7 +845,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
             name: id.$1,
             subtitle: id.$2,
             live: _cloneLive[labelIdx],
-            elapsedSeconds: _cloneElapsed[labelIdx],
+            elapsed: _cloneElapsed[labelIdx],
             onToggle: () => _toggleClone(labelIdx),
             selected: _selectedClone == labelIdx,
             onSelect: () => setState(() => _selectedClone = labelIdx),
@@ -1824,7 +1836,7 @@ class _CloneCard extends StatelessWidget {
   final String name;
   final String subtitle;
   final bool live;
-  final int elapsedSeconds;
+  final ValueListenable<int> elapsed;
   final VoidCallback onToggle; // CALL/CUT for this one clone
   final bool selected;
   final VoidCallback onSelect;
@@ -1833,7 +1845,7 @@ class _CloneCard extends StatelessWidget {
     required this.name,
     required this.subtitle,
     required this.live,
-    required this.elapsedSeconds,
+    required this.elapsed,
     required this.onToggle,
     required this.selected,
     required this.onSelect,
@@ -1925,20 +1937,23 @@ class _CloneCard extends StatelessWidget {
               right: 0,
               child: Center(child: _callButton()),
             ),
-            // Clock — 13px Regular.
+            // Clock — 13px Regular. Only this label rebuilds on the tick.
             Positioned(
               top: 285,
               left: 8,
               right: 8,
-              child: Text(
-                live ? _fmt(elapsedSeconds) : '00:00',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: _oCloneCardText,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w400,
-                  height: 1.0042,
-                  letterSpacing: 0.91,
+              child: ValueListenableBuilder<int>(
+                valueListenable: elapsed,
+                builder: (_, seconds, __) => Text(
+                  live ? _fmt(seconds) : '00:00',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: _oCloneCardText,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w400,
+                    height: 1.0042,
+                    letterSpacing: 0.91,
+                  ),
                 ),
               ),
             ),
@@ -1980,7 +1995,7 @@ class _CloneCard extends StatelessWidget {
 
 class _ClonesFilterColumn extends StatelessWidget {
   final List<bool> live;
-  final List<int> elapsed;
+  final List<ValueListenable<int>> elapsed;
   final bool anyLive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
@@ -2070,7 +2085,7 @@ class _ClonesFilterColumn extends StatelessWidget {
 // (whether that came from the master or the card's own CALL/CUT).
 class _CloneSessionsConsole extends StatelessWidget {
   final List<bool> live;
-  final List<int> elapsed;
+  final List<ValueListenable<int>> elapsed;
   final bool anyLive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
@@ -2142,7 +2157,6 @@ class _CloneSessionsConsole extends StatelessWidget {
   // filters are gone, so the rows can breathe.
   Widget _sessionRow(AppTheme t, int i) {
     final on = live[i];
-    final seconds = on ? elapsed[i] : 0;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
@@ -2156,15 +2170,19 @@ class _CloneSessionsConsole extends StatelessWidget {
               letterSpacing: 2.4,
             ),
           ),
-          Text(
-            _fmt(seconds),
-            style: TextStyle(
-              // Live clocks read in the fleet green; parked clocks stay
-              // in Figma's black-80% so the row still reads when idle.
-              color: on ? _oCallGreen : t.panelText,
-              fontSize: 24,
-              fontWeight: FontWeight.w300,
-              letterSpacing: 0.48,
+          // Only this clock rebuilds on the per-second tick.
+          ValueListenableBuilder<int>(
+            valueListenable: elapsed[i],
+            builder: (_, value, __) => Text(
+              _fmt(on ? value : 0),
+              style: TextStyle(
+                // Live clocks read in the fleet green; parked clocks stay
+                // in Figma's black-80% so the row still reads when idle.
+                color: on ? _oCallGreen : t.panelText,
+                fontSize: 24,
+                fontWeight: FontWeight.w300,
+                letterSpacing: 0.48,
+              ),
             ),
           ),
         ],

@@ -17,6 +17,20 @@ dependencies:
   # for the landing tile icons — the built-in Icons.xxx_outlined font
   # is fixed-weight and doesn't respond to Icon.weight.
   material_symbols_icons: ^4.2853.0
+  # Device image picker for the Inventory "Add product" form — lets staff
+  # upload a photo from the gallery instead of only pasting an image URL.
+  image_picker: ^1.1.2
+  # App documents directory for persisting the inventory catalog to a JSON
+  # file, so added/deleted products and uploaded images survive restarts.
+  path_provider: ^2.1.4
+  # Bulk catalog import (Inventory filter → Import spreadsheet): pick a
+  # CSV/XLSX file, parse rows, and best-effort extract images embedded in
+  # XLSX cells (via archive/xml unzip of the .xlsx package).
+  file_picker: ^8.1.2
+  csv: ^6.0.0
+  excel: ^4.0.6
+  archive: ^3.6.1
+  xml: ^6.5.0
 
 dev_dependencies:
   flutter_test:

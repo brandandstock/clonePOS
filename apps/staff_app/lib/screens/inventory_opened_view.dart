@@ -1,6 +1,11 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:clone_pos_core/models/product.dart';
-import '../data/seed_products_cybergic_500.dart';
+import '../data/catalog_importer.dart';
+import '../data/product_store.dart';
 import 'master_dashboard_screen.dart' show AppTheme;
 
 /// Inventory dashboard for the opened-state template. Fills the
@@ -71,7 +76,12 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
     return true;
   }
 
-  late final List<Product> _all = seedProductsCybergic500();
+  // Runtime catalog, loaded from disk in initState (seeded from the bundled
+  // 500 on first run). The "+ Add product" action appends and deletes remove,
+  // and every mutation is written back via _store so it survives a restart.
+  final ProductStore _store = ProductStore();
+  List<Product> _all = <Product>[];
+  bool _loading = true;
 
   // Drill state.
   _Level _level = _Level.categories;
@@ -99,8 +109,22 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
   @override
   void initState() {
     super.initState();
-    _rebuildDrillCaches();
+    _rebuildDrillCaches(); // empty scope until the catalog loads
+    _load();
   }
+
+  Future<void> _load() async {
+    final products = await _store.load();
+    if (!mounted) return;
+    setState(() {
+      _all = products;
+      _loading = false;
+      _rebuildDrillCaches();
+    });
+  }
+
+  /// Fire-and-forget write of the current catalog after any mutation.
+  void _persist() => _store.save(_all);
 
   @override
   void dispose() {
@@ -116,7 +140,12 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
     final inScope = <Product>[];
     for (final p in _all) {
       if (_category != null && p.category != _category) continue;
-      if (_subCategory != null && p.subCategory != _subCategory) continue;
+      // Match the SAME bucketing the sub-category grid uses (_subOf), so a
+      // product with no sub-category — grouped under the 'General' tile —
+      // is actually reachable when you drill into that tile. Comparing the
+      // raw p.subCategory here dropped those products (they showed a count
+      // but no products on drill-in).
+      if (_subCategory != null && _subOf(p) != _subCategory) continue;
       inScope.add(p);
     }
     _cachedInScope = inScope;
@@ -177,6 +206,328 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
         _inStockOnly = false;
         _sort = _SortMode.aToZ;
       });
+
+  // ----- Add product / categories -----------------------------------------
+
+  /// Every category across the whole catalog (not just the drill scope),
+  /// sorted A-Z. Feeds the "Category" suggestion menu in the add-product form.
+  List<String> get _allCategories {
+    final set = <String>{};
+    for (final p in _all) {
+      if (p.category.trim().isNotEmpty) set.add(p.category);
+    }
+    return set.toList()..sort();
+  }
+
+  /// Known sub-categories grouped by their parent category, each list
+  /// sorted A-Z. Feeds the form's "Sub-category" suggestions, filtered to
+  /// whatever category the user has entered.
+  Map<String, List<String>> get _subsByCategory {
+    final map = <String, Set<String>>{};
+    for (final p in _all) {
+      final sub = (p.subCategory ?? '').trim();
+      if (sub.isEmpty) continue;
+      map.putIfAbsent(p.category, () => <String>{}).add(sub);
+    }
+    return {
+      for (final e in map.entries) e.key: (e.value.toList()..sort()),
+    };
+  }
+
+  Future<void> _openAddProduct() async {
+    // Resolve the theme here — the context under this State is a descendant
+    // of the AppTheme InheritedWidget, but the dialog route's own context is
+    // not, so AppTheme.of() would fail inside the dialog. Pass it in instead.
+    final theme = AppTheme.of(context);
+    final created = await showDialog<Product>(
+      context: context,
+      builder: (_) => _AddProductDialog(
+        categories: _allCategories,
+        subsByCategory: _subsByCategory,
+        theme: theme,
+      ),
+    );
+    if (created == null || !mounted) return;
+    setState(() {
+      _all.add(created);
+      // Drill straight to the product list for the new product's
+      // category + sub-category bucket, so the product itself is on screen
+      // right away instead of the user having to tap down two levels. Using
+      // _subOf keeps null/empty sub-categories on the 'General' bucket that
+      // the grids and the drill filter agree on.
+      _category = created.category;
+      _subCategory = _subOf(created);
+      _focusedProduct = null;
+      _level = _Level.products;
+      _rebuildDrillCaches();
+    });
+    _persist();
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger?.showSnackBar(
+      SnackBar(
+        content: Text('Added "${created.name}" to ${created.category}'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  // ----- Bulk import (CSV / XLSX) -----------------------------------------
+
+  Future<void> _openImport() async {
+    final theme = AppTheme.of(context);
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['csv', 'xlsx'],
+      withData: true, // load bytes directly — no path/permission dance
+    );
+    if (picked == null || picked.files.isEmpty) return; // cancelled
+    final file = picked.files.first;
+    final bytes = file.bytes;
+    final ext = (file.extension ?? '').toLowerCase();
+    if (bytes == null) {
+      if (!mounted) return;
+      _showImportResult(theme, fatal: 'Could not read the selected file.');
+      return;
+    }
+
+    final report = CatalogImporter.parse(bytes: bytes, extension: ext);
+    if (!mounted) return;
+
+    if (report.fatal != null) {
+      _showImportResult(theme, fatal: report.fatal);
+      return;
+    }
+
+    // Merge by id: replace an existing product with the same id, else append.
+    var added = 0, updated = 0;
+    setState(() {
+      for (final p in report.products) {
+        final idx = _all.indexWhere((x) => x.id == p.id);
+        if (idx >= 0) {
+          _all[idx] = p;
+          updated++;
+        } else {
+          _all.add(p);
+          added++;
+        }
+      }
+      // Drop back to the categories root so the freshly-imported catalog is
+      // visible from the top rather than inside a stale drill scope.
+      _category = null;
+      _subCategory = null;
+      _focusedProduct = null;
+      _level = _Level.categories;
+      _rebuildDrillCaches();
+    });
+    _persist();
+
+    _showImportResult(
+      theme,
+      added: added,
+      updated: updated,
+      imagesMatched: report.imagesMatched,
+      issues: report.issues,
+    );
+  }
+
+  void _showImportResult(
+    AppTheme theme, {
+    String? fatal,
+    int added = 0,
+    int updated = 0,
+    int imagesMatched = 0,
+    List<String> issues = const [],
+  }) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: theme.panelBg,
+        title: Text(
+          fatal != null ? 'Import failed' : 'Import complete',
+          style: TextStyle(
+            color: theme.panelText,
+            fontSize: 18,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        content: SizedBox(
+          width: 420,
+          child: fatal != null
+              ? Text(
+                  fatal,
+                  style: TextStyle(color: theme.panelText, fontSize: 14),
+                )
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '$added added · $updated updated'
+                      '${imagesMatched > 0 ? ' · $imagesMatched image(s) matched' : ''}',
+                      style: TextStyle(
+                        color: theme.panelText,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    if (issues.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        '${issues.length} row(s) skipped:',
+                        style: TextStyle(
+                          color: theme.panelText,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 220),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              for (final msg in issues)
+                                Padding(
+                                  padding:
+                                      const EdgeInsets.only(bottom: 4),
+                                  child: Text(
+                                    msg,
+                                    style: TextStyle(
+                                      color: theme.panelText
+                                          .withValues(alpha: 0.8),
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFE87722),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ----- Delete (long-press → confirm) ------------------------------------
+
+  /// Sub-category bucket a product falls into — mirrors the grouping in
+  /// _SubCategoriesGrid so a 'General' tile (products with no sub-category)
+  /// deletes exactly the products that tile represents.
+  String _subOf(Product p) =>
+      (p.subCategory?.trim().isNotEmpty ?? false) ? p.subCategory! : 'General';
+
+  /// Removes every product matching [test], refreshes caches, then walks the
+  /// drill up out of any scope that just became empty so we never sit on a
+  /// blank grid or a detail view for a deleted product.
+  void _removeWhere(bool Function(Product) test) {
+    if (!mounted) return;
+    setState(() {
+      _all.removeWhere(test);
+      _persist();
+      _rebuildDrillCaches();
+      // Detail view whose product is gone → back to the products grid.
+      if (_level == _Level.productDetail &&
+          (_focusedProduct == null || !_all.contains(_focusedProduct))) {
+        _focusedProduct = null;
+        _level = _Level.products;
+      }
+      // Products grid emptied (last product in the sub gone) → up to subs.
+      if (_level == _Level.products && _cachedInScope.isEmpty) {
+        _subCategory = null;
+        _level = _Level.subCategories;
+        _rebuildDrillCaches();
+      }
+      // Sub grid emptied (category has no products left) → up to categories.
+      if (_level == _Level.subCategories && _cachedInScope.isEmpty) {
+        _category = null;
+        _level = _Level.categories;
+        _rebuildDrillCaches();
+      }
+    });
+  }
+
+  Future<bool> _confirmDelete(String title, String message) async {
+    final theme = AppTheme.of(context);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: theme.panelBg,
+        title: Text(
+          title,
+          style: TextStyle(
+            color: theme.panelText,
+            fontSize: 18,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        content: Text(
+          message,
+          style: TextStyle(color: theme.panelText, fontSize: 14, height: 1.35),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            style: TextButton.styleFrom(foregroundColor: theme.panelText),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFC62828),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
+  }
+
+  Future<void> _confirmDeleteCategory(String cat) async {
+    final count = _all.where((p) => p.category == cat).length;
+    final ok = await _confirmDelete(
+      'Delete category',
+      'Delete "$cat" and its $count product${count == 1 ? '' : 's'}?\n'
+          'This cannot be undone.',
+    );
+    if (ok) _removeWhere((p) => p.category == cat);
+  }
+
+  Future<void> _confirmDeleteSubCategory(String sub) async {
+    final cat = _category;
+    if (cat == null) return;
+    bool match(Product p) => p.category == cat && _subOf(p) == sub;
+    final count = _all.where(match).length;
+    final ok = await _confirmDelete(
+      'Delete sub-category',
+      'Delete "$sub" in $cat and its $count product${count == 1 ? '' : 's'}?\n'
+          'This cannot be undone.',
+    );
+    if (ok) _removeWhere(match);
+  }
+
+  Future<void> _confirmDeleteProduct(Product p) async {
+    final ok = await _confirmDelete(
+      'Delete product',
+      'Delete "${p.name}"?\nThis cannot be undone.',
+    );
+    if (ok) _removeWhere((x) => x.id == p.id);
+  }
 
   // ----- Derived data ------------------------------------------------------
 
@@ -363,6 +714,34 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
             const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
+              child: FilledButton.icon(
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('Add product'),
+                onPressed: _openAddProduct,
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFE87722),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.upload_file, size: 16),
+                label: const Text('Import spreadsheet'),
+                onPressed: _openImport,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFE87722),
+                  side: const BorderSide(color: Color(0xFFE87722)),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.refresh, size: 16),
                 label: const Text('Reset filters'),
@@ -445,11 +824,15 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
     // (or the product detail view). RIGHT flank rail drives vertical
     // scroll via widget.scrollController. LEFT rail scrolls the filter
     // panel in the summary column via widget.filterScrollController.
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
     switch (_level) {
       case _Level.categories:
         return _CategoriesGrid(
           products: _applyFilters(_productsInScope),
           onOpen: _drillIntoCategory,
+          onDelete: _confirmDeleteCategory,
           scrollController: widget.scrollController,
         );
       case _Level.subCategories:
@@ -457,6 +840,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
           category: _category!,
           products: _applyFilters(_productsInScope),
           onOpen: _drillIntoSubCategory,
+          onDelete: _confirmDeleteSubCategory,
           scrollController: widget.scrollController,
         );
       case _Level.products:
@@ -465,6 +849,7 @@ class InventoryOpenedViewState extends State<InventoryOpenedView> {
         return _ProductsGrid(
           products: list,
           onOpen: _drillIntoProduct,
+          onDelete: _confirmDeleteProduct,
           scrollController: widget.scrollController,
         );
       case _Level.productDetail:
@@ -577,10 +962,12 @@ class _DropdownFrame extends StatelessWidget {
 class _CategoriesGrid extends StatelessWidget {
   final Iterable<Product> products;
   final ValueChanged<String> onOpen;
+  final ValueChanged<String> onDelete;
   final ScrollController? scrollController;
   const _CategoriesGrid({
     required this.products,
     required this.onOpen,
+    required this.onDelete,
     this.scrollController,
   });
 
@@ -599,14 +986,18 @@ class _CategoriesGrid extends StatelessWidget {
       builder: (ctx, i) {
         final e = entries[i];
         final preview = e.value.firstWhere(
-          (p) => (p.imageUrl ?? '').isNotEmpty,
+          (p) =>
+              (p.imageUrl ?? '').isNotEmpty ||
+              (p.imageBytes?.isNotEmpty ?? false),
           orElse: () => e.value.first,
         );
         return _BrowseTile(
           title: e.key,
           subtitle: '${e.value.length} items',
           imageUrl: preview.imageUrl,
+          imageBytes: preview.imageBytes,
           onTap: () => onOpen(e.key),
+          onLongPress: () => onDelete(e.key),
         );
       },
     );
@@ -621,11 +1012,13 @@ class _SubCategoriesGrid extends StatelessWidget {
   final String category;
   final Iterable<Product> products;
   final ValueChanged<String> onOpen;
+  final ValueChanged<String> onDelete;
   final ScrollController? scrollController;
   const _SubCategoriesGrid({
     required this.category,
     required this.products,
     required this.onOpen,
+    required this.onDelete,
     this.scrollController,
   });
 
@@ -647,14 +1040,18 @@ class _SubCategoriesGrid extends StatelessWidget {
       builder: (ctx, i) {
         final e = entries[i];
         final preview = e.value.firstWhere(
-          (p) => (p.imageUrl ?? '').isNotEmpty,
+          (p) =>
+              (p.imageUrl ?? '').isNotEmpty ||
+              (p.imageBytes?.isNotEmpty ?? false),
           orElse: () => e.value.first,
         );
         return _BrowseTile(
           title: e.key,
           subtitle: '${e.value.length} items',
           imageUrl: preview.imageUrl,
+          imageBytes: preview.imageBytes,
           onTap: () => onOpen(e.key),
+          onLongPress: () => onDelete(e.key),
         );
       },
     );
@@ -668,10 +1065,12 @@ class _SubCategoriesGrid extends StatelessWidget {
 class _ProductsGrid extends StatelessWidget {
   final List<Product> products;
   final ValueChanged<Product> onOpen;
+  final ValueChanged<Product> onDelete;
   final ScrollController? scrollController;
   const _ProductsGrid({
     required this.products,
     required this.onOpen,
+    required this.onDelete,
     this.scrollController,
   });
 
@@ -694,7 +1093,11 @@ class _ProductsGrid extends StatelessWidget {
       childAspectRatio: 149 / 232,
       builder: (ctx, i) {
         final p = products[i];
-        return _ProductTile(product: p, onTap: () => onOpen(p));
+        return _ProductTile(
+          product: p,
+          onTap: () => onOpen(p),
+          onLongPress: () => onDelete(p),
+        );
       },
     );
   }
@@ -737,17 +1140,56 @@ class _CardGrid extends StatelessWidget {
   }
 }
 
+/// Builds the image for a product/preview, preferring uploaded [bytes]
+/// (Image.memory) over a remote [url] (Image.network), and falling back to
+/// [fallback] when neither is usable or fails to load. Centralises the
+/// bytes-vs-URL branch so every tile and the detail view render the same way.
+Widget _productImage({
+  Uint8List? bytes,
+  String? url,
+  required Widget fallback,
+  int? cacheWidth,
+  BoxFit fit = BoxFit.contain,
+  FilterQuality quality = FilterQuality.low,
+}) {
+  if (bytes != null && bytes.isNotEmpty) {
+    return Image.memory(
+      bytes,
+      fit: fit,
+      cacheWidth: cacheWidth,
+      filterQuality: quality,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) => fallback,
+    );
+  }
+  if ((url ?? '').isNotEmpty) {
+    return Image.network(
+      url!,
+      fit: fit,
+      cacheWidth: cacheWidth,
+      filterQuality: quality,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) => fallback,
+    );
+  }
+  return fallback;
+}
+
 class _BrowseTile extends StatelessWidget {
   final String title;
   final String subtitle;
   final String? imageUrl;
+  final Uint8List? imageBytes;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   const _BrowseTile({
     required this.title,
     required this.subtitle,
     required this.imageUrl,
+    this.imageBytes,
     required this.onTap,
+    this.onLongPress,
   });
 
   @override
@@ -758,6 +1200,7 @@ class _BrowseTile extends StatelessWidget {
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.all(12),
@@ -770,27 +1213,19 @@ class _BrowseTile extends StatelessWidget {
                   child: Container(
                     color: t.chipBg,
                     alignment: Alignment.center,
-                    child: (imageUrl ?? '').isNotEmpty
-                        ? Image.network(
-                            imageUrl!,
-                            fit: BoxFit.contain,
-                            // Downsample during decode — the tile only
-                            // paints at ~180 dp; a bigger bitmap only
-                            // wastes memory + decode time.
-                            cacheWidth: 200,
-                            filterQuality: FilterQuality.low,
-                            gaplessPlayback: true,
-                            errorBuilder: (_, __, ___) => Icon(
-                              Icons.inventory_2_outlined,
-                              size: 48,
-                              color: t.cardSubtleText,
-                            ),
-                          )
-                        : Icon(
-                            Icons.inventory_2_outlined,
-                            size: 48,
-                            color: t.cardSubtleText,
-                          ),
+                    // Downsample during decode — the tile only paints at
+                    // ~180 dp; a bigger bitmap only wastes memory + decode
+                    // time. Uploaded bytes win over a remote URL.
+                    child: _productImage(
+                      bytes: imageBytes,
+                      url: imageUrl,
+                      cacheWidth: 200,
+                      fallback: Icon(
+                        Icons.inventory_2_outlined,
+                        size: 48,
+                        color: t.cardSubtleText,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -825,7 +1260,12 @@ class _BrowseTile extends StatelessWidget {
 class _ProductTile extends StatelessWidget {
   final Product product;
   final VoidCallback onTap;
-  const _ProductTile({required this.product, required this.onTap});
+  final VoidCallback? onLongPress;
+  const _ProductTile({
+    required this.product,
+    required this.onTap,
+    this.onLongPress,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -837,6 +1277,7 @@ class _ProductTile extends StatelessWidget {
       borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.all(10),
@@ -849,24 +1290,16 @@ class _ProductTile extends StatelessWidget {
                   child: Container(
                     color: t.chipBg,
                     alignment: Alignment.center,
-                    child: (product.imageUrl ?? '').isNotEmpty
-                        ? Image.network(
-                            product.imageUrl!,
-                            fit: BoxFit.contain,
-                            cacheWidth: 200,
-                            filterQuality: FilterQuality.low,
-                            gaplessPlayback: true,
-                            errorBuilder: (_, __, ___) => Icon(
-                              Icons.image_not_supported_outlined,
-                              size: 40,
-                              color: t.cardSubtleText,
-                            ),
-                          )
-                        : Icon(
-                            Icons.image_not_supported_outlined,
-                            size: 40,
-                            color: t.cardSubtleText,
-                          ),
+                    child: _productImage(
+                      bytes: product.imageBytes,
+                      url: product.imageUrl,
+                      cacheWidth: 200,
+                      fallback: Icon(
+                        Icons.image_not_supported_outlined,
+                        size: 40,
+                        color: t.cardSubtleText,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -969,7 +1402,13 @@ class _ProductDetailView extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Expanded(flex: 4, child: _DetailImage(imageUrl: product.imageUrl)),
+          Expanded(
+            flex: 4,
+            child: _DetailImage(
+              imageUrl: product.imageUrl,
+              imageBytes: product.imageBytes,
+            ),
+          ),
           Expanded(
             flex: 6,
             child: SingleChildScrollView(
@@ -986,7 +1425,8 @@ class _ProductDetailView extends StatelessWidget {
 
 class _DetailImage extends StatelessWidget {
   final String? imageUrl;
-  const _DetailImage({required this.imageUrl});
+  final Uint8List? imageBytes;
+  const _DetailImage({required this.imageUrl, this.imageBytes});
 
   @override
   Widget build(BuildContext context) {
@@ -994,23 +1434,16 @@ class _DetailImage extends StatelessWidget {
       color: const Color(0xFFF3F3F3),
       alignment: Alignment.center,
       padding: const EdgeInsets.all(24),
-      child: (imageUrl ?? '').isNotEmpty
-          ? Image.network(
-              imageUrl!,
-              fit: BoxFit.contain,
-              filterQuality: FilterQuality.medium,
-              gaplessPlayback: true,
-              errorBuilder: (_, __, ___) => const Icon(
-                Icons.image_not_supported_outlined,
-                size: 96,
-                color: Color(0xFF888888),
-              ),
-            )
-          : const Icon(
-              Icons.image_not_supported_outlined,
-              size: 96,
-              color: Color(0xFF888888),
-            ),
+      child: _productImage(
+        bytes: imageBytes,
+        url: imageUrl,
+        quality: FilterQuality.medium,
+        fallback: const Icon(
+          Icons.image_not_supported_outlined,
+          size: 96,
+          color: Color(0xFF888888),
+        ),
+      ),
     );
   }
 }
@@ -1129,6 +1562,22 @@ class _DetailMeta extends StatelessWidget {
             ),
           ),
         ],
+        if ((product.specifications ?? '').trim().isNotEmpty) ...[
+          const SizedBox(height: 18),
+          Container(height: 1, color: const Color(0xFFEDEDED)),
+          const SizedBox(height: 14),
+          const Text(
+            'SPECIFICATIONS',
+            style: TextStyle(
+              color: Color(0xFF888888),
+              fontSize: 10,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 8),
+          _SpecTable(raw: product.specifications!),
+        ],
         const SizedBox(height: 22),
         // Action buttons — not yet wired to the printer/ledger; these are
         // placeholders that map to spec sections 2.5 (intake/print) and
@@ -1197,6 +1646,477 @@ class _MetaChip extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Renders a pasted spec block as an aligned table. Each non-empty line is a
+/// row; a line is split into cells by tab, else by the first ':' (so
+/// "Key: Value" lines work too), else it's a single spanning cell. The first
+/// column is treated as the label and shown bold.
+class _SpecTable extends StatelessWidget {
+  final String raw;
+  const _SpecTable({required this.raw});
+
+  List<List<String>> _parse() {
+    final rows = <List<String>>[];
+    for (final line in raw.split(RegExp(r'\r?\n'))) {
+      if (line.trim().isEmpty) continue;
+      List<String> cells;
+      if (line.contains('\t')) {
+        cells = line.split('\t').map((c) => c.trim()).toList();
+      } else if (line.contains(':')) {
+        final idx = line.indexOf(':');
+        cells = [
+          line.substring(0, idx).trim(),
+          line.substring(idx + 1).trim(),
+        ];
+      } else {
+        cells = [line.trim()];
+      }
+      rows.add(cells);
+    }
+    return rows;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = _parse();
+    if (rows.isEmpty) return const SizedBox.shrink();
+    final cols =
+        rows.fold<int>(1, (m, r) => r.length > m ? r.length : m);
+    const border = Color(0xFFEDEDED);
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: border),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Table(
+        border: const TableBorder(
+          horizontalInside: BorderSide(color: border),
+          verticalInside: BorderSide(color: border),
+        ),
+        columnWidths: cols == 2
+            ? const {0: IntrinsicColumnWidth(), 1: FlexColumnWidth()}
+            : null,
+        defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+        children: [
+          for (var i = 0; i < rows.length; i++)
+            TableRow(
+              decoration: BoxDecoration(
+                color: i.isEven ? const Color(0xFFFAFAFA) : Colors.white,
+              ),
+              children: [
+                for (var c = 0; c < cols; c++)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 7,
+                    ),
+                    child: Text(
+                      c < rows[i].length ? rows[i][c] : '',
+                      style: TextStyle(
+                        color: const Color(0xFF444444),
+                        fontSize: 12.5,
+                        height: 1.35,
+                        fontWeight:
+                            c == 0 ? FontWeight.w700 : FontWeight.w500,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Add-product form — opened as a modal dialog from the filter panel's
+// "Add product" button. Lets the user type a brand-new category and/or
+// sub-category (free text) OR pick an existing one from the suggestion
+// menus. Returns the built Product via Navigator.pop, or null on cancel.
+// This is an overlay: it does not touch the inventory panel/grid layout.
+// ---------------------------------------------------------------------------
+
+class _AddProductDialog extends StatefulWidget {
+  final List<String> categories;
+  final Map<String, List<String>> subsByCategory;
+
+  /// Resolved by the caller — see _openAddProduct. Passed in rather than
+  /// looked up via AppTheme.of(dialogContext), which would be null here.
+  final AppTheme theme;
+  const _AddProductDialog({
+    required this.categories,
+    required this.subsByCategory,
+    required this.theme,
+  });
+
+  @override
+  State<_AddProductDialog> createState() => _AddProductDialogState();
+}
+
+class _AddProductDialogState extends State<_AddProductDialog> {
+  final _name = TextEditingController();
+  final _price = TextEditingController();
+  final _category = TextEditingController();
+  final _subCategory = TextEditingController();
+  final _brand = TextEditingController();
+  final _stock = TextEditingController();
+  final _description = TextEditingController();
+  final _specs = TextEditingController();
+  final _imageUrl = TextEditingController();
+  final _picker = ImagePicker();
+
+  /// Bytes of an image uploaded from the device gallery. When set, this wins
+  /// over any pasted URL both in the preview here and on the product tiles.
+  Uint8List? _pickedBytes;
+  String? _error;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _price.dispose();
+    _category.dispose();
+    _subCategory.dispose();
+    _brand.dispose();
+    _stock.dispose();
+    _description.dispose();
+    _specs.dispose();
+    _imageUrl.dispose();
+    super.dispose();
+  }
+
+  /// Sub-category suggestions for whatever the user has typed as category,
+  /// matched case-insensitively. Empty when the category is new/unknown.
+  List<String> get _subOptions {
+    final cat = _category.text.trim().toLowerCase();
+    if (cat.isEmpty) return const [];
+    for (final e in widget.subsByCategory.entries) {
+      if (e.key.toLowerCase() == cat) return e.value;
+    }
+    return const [];
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final file = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1024,
+        maxHeight: 1024,
+        imageQuality: 85,
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      if (!mounted) return;
+      setState(() => _pickedBytes = bytes);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = 'Could not load image: $e');
+    }
+  }
+
+  void _submit() {
+    final name = _name.text.trim();
+    final category = _category.text.trim();
+    final price = double.tryParse(_price.text.trim());
+    if (name.isEmpty || category.isEmpty || price == null) {
+      setState(() => _error =
+          'Name, Category and a numeric Price are required.');
+      return;
+    }
+    final sub = _subCategory.text.trim();
+    final brand = _brand.text.trim();
+    final desc = _description.text.trim();
+    final specs = _specs.text.trim();
+    final img = _imageUrl.text.trim();
+    final stock = int.tryParse(_stock.text.trim());
+    final id = 'USR-${DateTime.now().millisecondsSinceEpoch}';
+    Navigator.of(context).pop(
+      Product(
+        id: id,
+        name: name,
+        price: price,
+        category: category,
+        subCategory: sub.isEmpty ? null : sub,
+        brand: brand.isEmpty ? null : brand,
+        description: desc.isEmpty ? null : desc,
+        specifications: specs.isEmpty ? null : specs,
+        stock: stock,
+        imageUrl: img.isEmpty ? null : img,
+        imageBytes: _pickedBytes,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.theme;
+    return AlertDialog(
+      backgroundColor: t.panelBg,
+      title: Text(
+        'Add product',
+        style: TextStyle(
+          color: t.panelText,
+          fontSize: 20,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 0.5,
+        ),
+      ),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _fieldLabel('NAME *'),
+              _plainField(_name, 'Product name'),
+              const SizedBox(height: 12),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _fieldLabel('PRICE (₹) *'),
+                        _plainField(_price, '0',
+                            keyboard: TextInputType.number),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _fieldLabel('STOCK'),
+                        _plainField(_stock, '0',
+                            keyboard: TextInputType.number),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _fieldLabel('CATEGORY *'),
+              _ComboField(
+                controller: _category,
+                hint: 'Pick or type a new category',
+                options: widget.categories,
+                // Re-typing/clearing the category changes which sub-category
+                // suggestions apply, so refresh the menu.
+                onChanged: () => setState(() {}),
+              ),
+              const SizedBox(height: 12),
+              _fieldLabel('SUB-CATEGORY'),
+              _ComboField(
+                controller: _subCategory,
+                hint: 'Pick or type a new sub-category',
+                options: _subOptions,
+              ),
+              const SizedBox(height: 12),
+              _fieldLabel('BRAND'),
+              _plainField(_brand, 'Brand (optional)'),
+              const SizedBox(height: 12),
+              _fieldLabel('IMAGE'),
+              _imagePicker(),
+              const SizedBox(height: 8),
+              _plainField(_imageUrl, 'or paste an image URL (https://)'),
+              const SizedBox(height: 12),
+              _fieldLabel('DESCRIPTION'),
+              _plainField(_description, 'Optional', maxLines: 3),
+              const SizedBox(height: 12),
+              _fieldLabel('SPECIFICATIONS'),
+              _plainField(
+                _specs,
+                'Paste rows from Excel, or "Key: Value" per line',
+                maxLines: 5,
+              ),
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _error!,
+                  style: const TextStyle(
+                    color: Color(0xFFC62828),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          style: TextButton.styleFrom(
+            foregroundColor: t.panelText,
+          ),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFFE87722),
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Add'),
+        ),
+      ],
+    );
+  }
+
+  Widget _fieldLabel(String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 6),
+        child: Text(
+          text,
+          style: TextStyle(
+            fontSize: 10,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.2,
+            color: widget.theme.panelText.withValues(alpha: 0.6),
+          ),
+        ),
+      );
+
+  /// Upload row: a thumbnail of the picked image (or a placeholder) beside
+  /// an "Upload from device" button. When an image is picked the button
+  /// becomes "Replace" and a "Remove" text button appears.
+  Widget _imagePicker() {
+    final has = _pickedBytes != null;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Container(
+          width: 56,
+          height: 56,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          clipBehavior: Clip.antiAlias,
+          alignment: Alignment.center,
+          child: has
+              ? Image.memory(_pickedBytes!, fit: BoxFit.cover,
+                  width: 56, height: 56)
+              : const Icon(Icons.image_outlined,
+                  size: 24, color: Color(0xFF888888)),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _pickImage,
+            icon: Icon(has ? Icons.swap_horiz : Icons.upload, size: 16),
+            label: Text(has ? 'Replace' : 'Upload from device'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFF2E2E2E),
+              side: const BorderSide(color: Color(0xFF888888)),
+              padding: const EdgeInsets.symmetric(vertical: 10),
+            ),
+          ),
+        ),
+        if (has) ...[
+          const SizedBox(width: 4),
+          IconButton(
+            onPressed: () => setState(() => _pickedBytes = null),
+            icon: const Icon(Icons.close, size: 18),
+            tooltip: 'Remove image',
+            color: const Color(0xFFC62828),
+            visualDensity: VisualDensity.compact,
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _plainField(
+    TextEditingController c,
+    String hint, {
+    TextInputType? keyboard,
+    int maxLines = 1,
+  }) {
+    return TextField(
+      controller: c,
+      keyboardType: keyboard,
+      maxLines: maxLines,
+      style: const TextStyle(fontSize: 13, color: Color(0xFF2E2E2E)),
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: hint,
+        hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+        filled: true,
+        fillColor: Colors.white,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      ),
+    );
+  }
+}
+
+/// Text field with a dropdown-arrow menu of existing [options]. Typing is
+/// always allowed (so a brand-new category/sub can be entered); picking a
+/// menu item just fills the field. [onChanged] fires on both paths.
+class _ComboField extends StatelessWidget {
+  final TextEditingController controller;
+  final String hint;
+  final List<String> options;
+  final VoidCallback? onChanged;
+  const _ComboField({
+    required this.controller,
+    required this.hint,
+    required this.options,
+    this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      onChanged: (_) => onChanged?.call(),
+      style: const TextStyle(fontSize: 13, color: Color(0xFF2E2E2E)),
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: hint,
+        hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+        filled: true,
+        fillColor: Colors.white,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(6),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        suffixIcon: options.isEmpty
+            ? null
+            : PopupMenuButton<String>(
+                icon: const Icon(Icons.arrow_drop_down,
+                    color: Color(0xFF888888)),
+                tooltip: 'Existing',
+                onSelected: (v) {
+                  controller.text = v;
+                  controller.selection = TextSelection.collapsed(
+                    offset: v.length,
+                  );
+                  onChanged?.call();
+                },
+                itemBuilder: (_) => [
+                  for (final o in options)
+                    PopupMenuItem<String>(
+                      value: o,
+                      child: Text(o, style: const TextStyle(fontSize: 13)),
+                    ),
+                ],
+              ),
       ),
     );
   }
