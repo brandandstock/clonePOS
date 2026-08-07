@@ -7,7 +7,13 @@ import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
 import '../comm/walkie_service.dart';
 import '../data/active_cart.dart';
+import '../data/clone_access_store.dart';
 import '../data/clone_fleet_store.dart';
+import '../data/clone_roster_store.dart';
+import '../data/plan_store.dart';
+import 'clone_access_dialog.dart';
+import 'clone_hub_dialog.dart';
+import 'create_clone_dialog.dart';
 import 'inventory_opened_view.dart';
 import 'walkie_dialog.dart';
 import 'sales_kit_opened_view.dart';
@@ -311,6 +317,9 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // scrolls the tile grid.
   final ScrollController _leftRailHorizontalCtrl = ScrollController();
   final ScrollController _rightRailVerticalCtrl = ScrollController();
+  // Vertical scroll for the Clones fleet grid (can exceed the 2 visible rows
+  // once a plan unlocks more than six slots).
+  final ScrollController _clonesGridCtrl = ScrollController();
 
   // Reference the currently-mounted InventoryOpenedView so the shared
   // chevron_back can drill up through its category/sub/product/detail
@@ -323,16 +332,198 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   final GlobalKey<SalesKitOpenedViewState> _salesKitKey =
       GlobalKey<SalesKitOpenedViewState>();
 
+  // ── Clone access grants (per-clone) ───────────────────────────────
+  // For each created satellite, which app features the master permits it to
+  // open. Index-aligned to the fleet (0.._cloneCount-1). Edited from
+  // Settings → Clone Access, persisted via CloneAccessStore. First run
+  // (nothing saved) grants every feature to every clone.
+  final CloneAccessStore _accessStore = CloneAccessStore();
+  late List<Set<String>> _cloneAccess = List.generate(
+    _cloneCount,
+    (_) => kCloneAccessFeatures.toSet(),
+  );
+
+  // ── Clone roster (created satellites) ──────────────────────────────
+  // Which of the fixed fleet slots have been created and each one's
+  // name/department. A null slot is an empty "Create Clone" tile. Seeded
+  // from _cloneIdentities on first run; persisted via CloneRosterStore.
+  final CloneRosterStore _rosterStore = CloneRosterStore();
+  // Seed: the first six slots hold the standard fleet; the rest start empty
+  // (created on demand, up to the plan's capacity).
+  late List<CloneRecord?> _clones = [
+    for (var i = 0; i < _cloneCount; i++)
+      i < _cloneIdentities.length
+          ? CloneRecord(_cloneIdentities[i].$1, _cloneIdentities[i].$2)
+          : null,
+  ];
+
+  // ── Subscription plan (clone capacity) ─────────────────────────────
+  final PlanStore _planStore = PlanStore();
+  SubscriptionPlan _plan = SubscriptionPlan.basic;
+
+  int get _capacity => _plan.capacity;
+  int get _createdCount => _clones.where((c) => c != null).length;
+
+  /// First empty slot within the plan's capacity, or null when the plan is
+  /// full (→ create is locked, upgrade required).
+  int? _nextFreeSlot() {
+    for (var i = 0; i < _capacity && i < _cloneCount; i++) {
+      if (_clones[i] == null) return i;
+    }
+    return null;
+  }
+
+  void _setPlan(SubscriptionPlan plan) {
+    setState(() => _plan = plan);
+    _planStore.save(plan);
+  }
+
   @override
   void initState() {
     super.initState();
+    _loadPlan(); // restore the subscription plan (clone capacity)
+    _loadRoster(); // restore the created-clone roster
     _loadFleet(); // restore any previously-online clones
+    _loadAccess(); // restore the per-clone access grants
+  }
+
+  Future<void> _loadPlan() async {
+    final saved = await _planStore.load();
+    if (saved != null && mounted) setState(() => _plan = saved);
+  }
+
+  Future<void> _loadRoster() async {
+    final saved = await _rosterStore.load(_cloneCount);
+    if (saved != null && mounted) setState(() => _clones = saved);
+  }
+
+  Future<void> _loadAccess() async {
+    final saved = await _accessStore.load(_cloneCount);
+    if (saved != null && mounted) setState(() => _cloneAccess = saved);
+  }
+
+  /// Create a clone into empty [slot]: capture a name + department, then
+  /// register it with full access and a parked (offline) session.
+  void _createCloneAt(int slot) {
+    final theme = AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+    showDialog(
+      context: context,
+      builder: (_) => CreateCloneDialog(
+        theme: theme,
+        slotNumber: slot + 1,
+        onCreate: (record) {
+          setState(() {
+            _clones[slot] = record;
+            _cloneAccess[slot] = kCloneAccessFeatures.toSet(); // full access
+            _disconnect(slot); // ensure the slot's session starts parked
+            _selectedClone = slot;
+          });
+          _rosterStore.save(_clones);
+          _accessStore.save(_cloneAccess);
+          _syncCloneTicker();
+          _persistFleet();
+        },
+      ),
+    );
+  }
+
+  /// Remove the clone in [slot] after confirmation, freeing it back to an
+  /// empty "Create Clone" tile and parking its session.
+  void _deleteCloneAt(int slot) {
+    final record = _clones[slot];
+    if (record == null) return;
+    final theme = AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: theme.panelBg,
+        title: Text('Remove ${record.name}?',
+            style: TextStyle(
+                color: theme.panelText, fontWeight: FontWeight.w800)),
+        content: Text(
+          'This frees slot ${slot + 1}. The clone and its access grant are '
+          'cleared; you can create a new one in its place.',
+          style: TextStyle(color: theme.panelText.withValues(alpha: 0.75)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            style: TextButton.styleFrom(foregroundColor: theme.panelText),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              setState(() {
+                _disconnect(slot); // park any live/dialling session
+                _clones[slot] = null;
+                _cloneAccess[slot] = kCloneAccessFeatures.toSet(); // reset
+                if (_selectedClone == slot) _selectedClone = null;
+              });
+              _rosterStore.save(_clones);
+              _accessStore.save(_cloneAccess);
+              _syncCloneTicker();
+              _persistFleet();
+            },
+            style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFA80B0B),
+                foregroundColor: Colors.white),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // AppTheme is created *inside* this State's build(), so the State's own
+  // context sits above it — AppTheme.of(context) would find nothing. Build the
+  // palette straight from _darkMode instead. (The child is unused; dialogs
+  // only read AppTheme's colour getters.)
+  AppTheme get _dialogTheme =>
+      AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+
+  /// Settings → Clone Access opens the fleet HUB first: plan + usage, create
+  /// clone (capacity-gated), plan switch, and a route into feature access.
+  void _openCloneAccess() {
+    showDialog(
+      context: context,
+      builder: (_) => CloneHubDialog(
+        theme: _dialogTheme,
+        plan: _plan,
+        usedCount: _createdCount,
+        onCreate: () {
+          final slot = _nextFreeSlot();
+          if (slot != null) _createCloneAt(slot);
+        },
+        onManageAccess: _openManageAccess,
+        onPlanChange: _setPlan,
+      ),
+    );
+  }
+
+  /// The per-clone feature-access grant editor (reached from the hub).
+  void _openManageAccess() {
+    showDialog(
+      context: context,
+      builder: (_) => CloneAccessDialog(
+        theme: _dialogTheme,
+        granted: _cloneAccess,
+        // Null entries are empty slots — the selector skips them so only
+        // created clones are grantable, kept index-aligned to _cloneAccess.
+        cloneNames: [for (final c in _clones) c?.name],
+        onChanged: (next) {
+          setState(() => _cloneAccess = next);
+          _accessStore.save(next);
+        },
+      ),
+    );
   }
 
   @override
   void dispose() {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
+    _clonesGridCtrl.dispose();
     _cloneTicker?.cancel();
     for (final t in _connectTimers) {
       t?.cancel();
@@ -356,7 +547,9 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // next launch. A single ticker advances every ONLINE clone's clock once a
   // second via per-clone ValueNotifiers, so only the two timer labels
   // rebuild — never the whole dashboard (that was the app-wide lag).
-  static const int _cloneCount = 6;
+  // Physical fleet-slot count = the Enterprise capacity. The active plan
+  // gates how many of these slots are actually usable (the rest are locked).
+  static const int _cloneCount = kMaxClones;
   // Real LAN walkie-talkie (created lazily so the mic isn't requested until
   // the user opens the walkie panel).
   WalkieService? _walkie;
@@ -451,6 +644,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     setState(() {
       var stagger = 0;
       for (var i = 0; i < _cloneCount; i++) {
+        // Skip empty slots — only created clones join the fleet call.
+        if (_clones[i] == null) continue;
         if (_cloneStatus[i] == _CloneStatus.offline) {
           _beginConnect(i, stagger: stagger++);
         }
@@ -816,6 +1011,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               child: _SettingsPanelBody(
                 darkMode: _darkMode,
                 onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+                onCloneAccess: _openCloneAccess,
                 onNoop: () {},
               ),
             ),
@@ -834,8 +1030,19 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
           // on each clone's detail page.
           child: openedLabel == 'Clones'
               ? _ClonesFilterColumn(
-                  statuses: _cloneStatus,
-                  elapsed: _cloneElapsed,
+                  // SESSIONS lists only the created clones, by slot number.
+                  slotNumbers: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) i + 1,
+                  ],
+                  statuses: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) _cloneStatus[i],
+                  ],
+                  elapsed: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) _cloneElapsed[i],
+                  ],
                   anyActive: _anyActive,
                   onCallAll: _callAllClones,
                   onCutAll: _cutAllClones,
@@ -850,7 +1057,14 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         // Stack children would otherwise composite on top of the
         // labelled tiles (visible bleed under empty cells in the
         // Cart bento — session-10 fix).
-        ..._buildOpenedTileGrid(openedLabel),
+        //
+        // Clones renders a scrollable, plan-gated fleet grid (created cards,
+        // empty "Create" slots, and locked upgrade teasers); every other tab
+        // keeps its fixed 3×2 sub-detail tile grid.
+        if (openedLabel == 'Clones')
+          _buildClonesGridRegion()
+        else
+          ..._buildOpenedTileGrid(openedLabel),
         if (_settingsPanelOn)
           Positioned(
             left: _oGridStartX + 3 * (_oTileW + _oGridGap), // col 4 (x=893)
@@ -861,6 +1075,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               child: _SettingsPanelBody(
                 darkMode: _darkMode,
                 onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+                onCloneAccess: _openCloneAccess,
                 onNoop: () {},
               ),
             ),
@@ -917,22 +1132,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         final y = _oGridStartY + row * (_oTileH + _oGridGap);
         final labelIdx = row * 3 + innerCol;
         final Widget cell;
-        if (openedLabel == 'Clones') {
-          // Clone tiles are live call cards, not drill-in tiles. Their
-          // live/timer state is owned by the parent so the SESSIONS
-          // master control and the card share one source of truth.
-          final id = _cloneIdentities[labelIdx % _cloneIdentities.length];
-          cell = _CloneCard(
-            number: labelIdx + 1,
-            name: id.$1,
-            subtitle: id.$2,
-            status: _cloneStatus[labelIdx],
-            elapsed: _cloneElapsed[labelIdx],
-            onToggle: () => _toggleClone(labelIdx),
-            selected: _selectedClone == labelIdx,
-            onSelect: () => setState(() => _selectedClone = labelIdx),
-          );
-        } else if (labels != null) {
+        if (labels != null) {
           cell = _LabelledTile(
             label: labels[labelIdx],
             onTap: () => setState(() => _openSubIndex = labelIdx + 1),
@@ -950,6 +1150,64 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
       }
     }
     return widgets;
+  }
+
+  /// Clones-only: a scrollable, plan-gated fleet grid filling the tile region
+  /// (cols 1-3, or 1-2 when the Settings panel is open). Renders up to the
+  /// plan's [SubscriptionPlanX.displaySlots]: created clones as call cards,
+  /// empty in-capacity slots as "Create Clone" tiles, and slots beyond the
+  /// plan's capacity as locked upgrade teasers. Scrolls vertically once the
+  /// unlocked fleet exceeds the two visible rows.
+  Widget _buildClonesGridRegion() {
+    final cols = _settingsPanelOn ? 2 : 3;
+    final width = _settingsPanelOn
+        ? (_oTileW * 2 + _oGridGap)
+        : (_oTileW * 3 + _oGridGap * 2);
+    final display = _plan.displaySlots;
+    return Positioned(
+      left: _oGridStartX + (_oTileW + _oGridGap), // col 1 (x=389)
+      top: _oGridStartY,
+      width: width,
+      height: _oTileH * 2 + _oGridGap,
+      child: GridView.builder(
+        controller: _clonesGridCtrl,
+        padding: EdgeInsets.zero,
+        physics: const ClampingScrollPhysics(),
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: cols,
+          mainAxisSpacing: _oGridGap,
+          crossAxisSpacing: _oGridGap,
+          childAspectRatio: _oTileW / _oTileH,
+        ),
+        itemCount: display,
+        itemBuilder: (_, i) {
+          final record = _clones[i];
+          if (record != null) {
+            // A created clone always shows as a card (even if it now sits
+            // beyond a downgraded plan's capacity).
+            return _CloneCard(
+              number: i + 1,
+              name: record.name,
+              subtitle: record.department,
+              status: _cloneStatus[i],
+              elapsed: _cloneElapsed[i],
+              onToggle: () => _toggleClone(i),
+              selected: _selectedClone == i,
+              onSelect: () => setState(() => _selectedClone = i),
+              onDelete: () => _deleteCloneAt(i),
+            );
+          }
+          if (i < _capacity) {
+            return _CreateCloneTile(onTap: () => _createCloneAt(i));
+          }
+          // Beyond capacity, empty → locked upgrade teaser.
+          return _LockedCloneTile(
+            targetPlan: _plan.next,
+            onTap: _openCloneAccess, // hub → Change plan
+          );
+        },
+      ),
+    );
   }
 
   /// Build the LANDING tile grid — 4×2 of white text-labelled tab
@@ -1042,6 +1300,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
             child: _SettingsPanelBody(
               darkMode: _darkMode,
               onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+              onCloneAccess: _openCloneAccess,
               onNoop: () {},
             ),
           ),
@@ -1912,13 +2171,143 @@ const List<(String, String)> _cloneIdentities = [
 ];
 
 // ---------------------------------------------------------------------------
+// Empty-slot tile on the Clones grid — the master taps it to CREATE a clone
+// (register a new Satellite). Occupies the same 250×350 footprint as a call
+// card; theme-aware since it's a new element (not a client-locked mock).
+// ---------------------------------------------------------------------------
+
+class _CreateCloneTile extends StatelessWidget {
+  final VoidCallback onTap;
+  const _CreateCloneTile({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Material(
+      color: t.cardBg.withValues(alpha: t.dark ? 0.35 : 0.55),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: t.cardText.withValues(alpha: 0.28),
+              width: 1.5,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: const BoxDecoration(
+                  color: _oCloneOrange,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.add, color: Colors.white, size: 38),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Create Clone',
+                style: TextStyle(
+                  color: t.cardText,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -0.4,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Empty slot',
+                style: TextStyle(
+                  color: t.cardText.withValues(alpha: 0.55),
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Locked fleet slot — shown for slots beyond the current plan's capacity.
+// A padlock + upgrade teaser naming the tier that unlocks it; tapping opens
+// the Clone Access hub (where the plan can be changed). Same 250×350 footprint.
+// ---------------------------------------------------------------------------
+
+class _LockedCloneTile extends StatelessWidget {
+  final SubscriptionPlan? targetPlan;
+  final VoidCallback onTap;
+  const _LockedCloneTile({required this.targetPlan, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Material(
+      color: t.cardBg.withValues(alpha: t.dark ? 0.18 : 0.4),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: t.cardText.withValues(alpha: 0.16),
+              width: 1.5,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.lock_outline,
+                  size: 44, color: t.cardText.withValues(alpha: 0.4)),
+              const SizedBox(height: 14),
+              Text(
+                'Locked',
+                style: TextStyle(
+                  color: t.cardText.withValues(alpha: 0.6),
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                child: Text(
+                  targetPlan == null
+                      ? 'Max fleet reached'
+                      : 'Upgrade to ${targetPlan!.label}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: _oCloneOrange,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Clone call card — one per clone tile on the Clones overview grid.
 //   Idle → grey card, green CALL, clock parked at 00:00.
 //   Live → mustard-yellow card, red CUT, clock ticking.
 // Stateless: its live/timer state is owned by the parent so the SESSIONS
 // master control ("call all") and this card stay in lockstep. Tap CALL/
 // CUT toggles just this clone; tapping the body selects it (blue border).
-// The badge is a fixed "1" on every card per client.
+// Long-press removes the clone (frees the slot). The badge is the slot number.
 // ---------------------------------------------------------------------------
 
 class _CloneCard extends StatelessWidget {
@@ -1930,6 +2319,7 @@ class _CloneCard extends StatelessWidget {
   final VoidCallback onToggle; // CALL/CUT for this one clone
   final bool selected;
   final VoidCallback onSelect;
+  final VoidCallback onDelete; // long-press to remove this clone
   const _CloneCard({
     required this.number,
     required this.name,
@@ -1939,6 +2329,7 @@ class _CloneCard extends StatelessWidget {
     required this.onToggle,
     required this.selected,
     required this.onSelect,
+    required this.onDelete,
   });
 
   String _fmt(int s) =>
@@ -1953,6 +2344,7 @@ class _CloneCard extends StatelessWidget {
     final connecting = status == _CloneStatus.connecting;
     return GestureDetector(
       onTap: onSelect,
+      onLongPress: onDelete,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
         curve: Curves.easeOutCubic,
@@ -2104,6 +2496,7 @@ class _CloneCard extends StatelessWidget {
 }
 
 class _ClonesFilterColumn extends StatelessWidget {
+  final List<int> slotNumbers; // 1-based slot label per created clone
   final List<_CloneStatus> statuses;
   final List<ValueListenable<int>> elapsed;
   final bool anyActive;
@@ -2111,6 +2504,7 @@ class _ClonesFilterColumn extends StatelessWidget {
   final VoidCallback onCutAll;
   final VoidCallback onWalkie;
   const _ClonesFilterColumn({
+    required this.slotNumbers,
     required this.statuses,
     required this.elapsed,
     required this.anyActive,
@@ -2176,6 +2570,7 @@ class _ClonesFilterColumn extends StatelessWidget {
           child: SizedBox(
             width: 210,
             child: _CloneSessionsConsole(
+              slotNumbers: slotNumbers,
               statuses: statuses,
               elapsed: elapsed,
               anyActive: anyActive,
@@ -2197,6 +2592,7 @@ class _ClonesFilterColumn extends StatelessWidget {
 // once, and each row mirrors whatever state its clone is currently in
 // (whether that came from the master or the card's own CALL/CUT).
 class _CloneSessionsConsole extends StatelessWidget {
+  final List<int> slotNumbers; // 1-based slot label per created clone
   final List<_CloneStatus> statuses;
   final List<ValueListenable<int>> elapsed;
   final bool anyActive;
@@ -2204,6 +2600,7 @@ class _CloneSessionsConsole extends StatelessWidget {
   final VoidCallback onCutAll;
   final VoidCallback onWalkie;
   const _CloneSessionsConsole({
+    required this.slotNumbers,
     required this.statuses,
     required this.elapsed,
     required this.anyActive,
@@ -2311,7 +2708,7 @@ class _CloneSessionsConsole extends StatelessWidget {
       child: Column(
         children: [
           Text(
-            'CLONE :0${i + 1}',
+            'CLONE :${slotNumbers[i].toString().padLeft(2, '0')}',
             style: TextStyle(
               color: t.panelText,
               fontSize: 15,
@@ -2787,10 +3184,12 @@ class _RightColumnPanel extends StatelessWidget {
 class _SettingsPanelBody extends StatelessWidget {
   final bool darkMode;
   final VoidCallback onToggleTheme;
+  final VoidCallback onCloneAccess;
   final VoidCallback onNoop;
   const _SettingsPanelBody({
     required this.darkMode,
     required this.onToggleTheme,
+    required this.onCloneAccess,
     required this.onNoop,
   });
 
@@ -2828,6 +3227,11 @@ class _SettingsPanelBody extends StatelessWidget {
             icon: Icons.translate_outlined,
             label: 'Language',
             onTap: onNoop,
+          ),
+          _PanelRow(
+            icon: Icons.shield_outlined,
+            label: 'Clone Access',
+            onTap: onCloneAccess,
           ),
           const Spacer(),
           Divider(color: t.divider, height: 1),
