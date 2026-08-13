@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'data/role_store.dart';
 import 'theme/clone_pos_theme.dart';
 import 'screens/master_dashboard_screen.dart';
+import 'screens/role_chooser_screen.dart';
+import 'screens/satellite_view_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,11 +29,76 @@ class CloneposStaffApp extends StatelessWidget {
       title: 'Clone-POS Staff',
       debugShowCheckedModeBanner: false,
       theme: ClonePosTheme.staffAppTheme,
-      // Prototype note: this always launches straight into the Master
-      // dashboard. The real build needs a pairing/role-selection flow
-      // first (Set up as Master / Pair to existing Master as Satellite)
-      // per the roadmap doc, Phase 3.
-      home: const MasterDashboardScreen(),
+      home: const _RoleGate(),
     );
+  }
+}
+
+/// Routes the app by this device's persisted role: the role chooser on first
+/// launch, then the Master dashboard or the Satellite (Clone) view. Sign-out
+/// clears the role and returns to the chooser.
+class _RoleGate extends StatefulWidget {
+  const _RoleGate();
+
+  @override
+  State<_RoleGate> createState() => _RoleGateState();
+}
+
+class _RoleGateState extends State<_RoleGate> {
+  final RoleStore _store = RoleStore();
+  RoleConfig? _config; // null while loading
+
+  @override
+  void initState() {
+    super.initState();
+    _store.load().then((c) {
+      if (mounted) setState(() => _config = c);
+    });
+  }
+
+  Future<void> _becomeMaster() async {
+    await _store.saveMaster();
+    if (mounted) setState(() => _config = const RoleConfig(DeviceRole.master));
+  }
+
+  Future<void> _becomeClone(String biz, String clone) async {
+    await _store.saveClone(biz, clone);
+    if (mounted) {
+      setState(() => _config =
+          RoleConfig(DeviceRole.clone, businessId: biz, cloneId: clone));
+    }
+  }
+
+  Future<void> _signOut() async {
+    await _store.clear();
+    if (mounted) setState(() => _config = RoleConfig.unset);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final config = _config;
+    if (config == null) {
+      return const Scaffold(
+        backgroundColor: Color(0xFF1A1A1A),
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFFE87722)),
+        ),
+      );
+    }
+    switch (config.role) {
+      case DeviceRole.master:
+        return MasterDashboardScreen(onSignOut: _signOut);
+      case DeviceRole.clone:
+        return SatelliteViewScreen(
+          businessId: config.businessId,
+          cloneId: config.cloneId,
+          onSignOut: _signOut,
+        );
+      case DeviceRole.unset:
+        return RoleChooserScreen(
+          onMaster: _becomeMaster,
+          onClone: _becomeClone,
+        );
+    }
   }
 }

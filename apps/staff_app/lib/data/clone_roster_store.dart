@@ -3,22 +3,33 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
-/// One created clone (Satellite): a display name + its department/posting
-/// (shown as the card subtitle). A fleet slot with no record is an empty
-/// "Create Clone" slot the master can fill.
+/// One created clone (Satellite): a display name, its department/posting
+/// (shown as the card subtitle), and the [cloneId] the satellite device signs
+/// in with (paired to the business + this clone's granted permissions). A
+/// fleet slot with no record is an empty "Create Clone" slot the master fills.
 class CloneRecord {
   final String name;
   final String department;
-  const CloneRecord(this.name, this.department);
+  final String cloneId; // may be empty on legacy records; backfilled on load
+  const CloneRecord(this.name, this.department, {this.cloneId = ''});
 
-  Map<String, dynamic> toJson() => {'name': name, 'department': department};
+  CloneRecord withCloneId(String id) =>
+      CloneRecord(name, department, cloneId: id);
+
+  Map<String, dynamic> toJson() =>
+      {'name': name, 'department': department, 'cloneId': cloneId};
 
   static CloneRecord? fromJson(Object? j) {
     if (j is! Map) return null;
     final name = j['name'];
     if (name is! String || name.isEmpty) return null;
     final dept = j['department'];
-    return CloneRecord(name, dept is String ? dept : '');
+    final id = j['cloneId'];
+    return CloneRecord(
+      name,
+      dept is String ? dept : '',
+      cloneId: id is String ? id : '',
+    );
   }
 }
 

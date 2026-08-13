@@ -12,11 +12,15 @@ const Color _orange = Color(0xFFE87722);
 class CreateCloneDialog extends StatefulWidget {
   final AppTheme theme;
   final int slotNumber; // 1-based slot the clone will occupy (badge numeral)
+  final String businessId; // shown so the master can hand over the pair
+  final String cloneId; // pre-assigned sign-in ID for this clone
   final ValueChanged<CloneRecord> onCreate;
   const CreateCloneDialog({
     super.key,
     required this.theme,
     required this.slotNumber,
+    required this.businessId,
+    required this.cloneId,
     required this.onCreate,
   });
 
@@ -43,7 +47,11 @@ class _CreateCloneDialogState extends State<CreateCloneDialog> {
       return;
     }
     final dept = _dept.text.trim();
-    widget.onCreate(CloneRecord(name, dept.isEmpty ? 'Satellite' : dept));
+    widget.onCreate(CloneRecord(
+      name,
+      dept.isEmpty ? 'Satellite' : dept,
+      cloneId: widget.cloneId,
+    ));
     Navigator.of(context).pop();
   }
 
@@ -86,16 +94,8 @@ class _CreateCloneDialogState extends State<CreateCloneDialog> {
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
-              Text(
-                'Register a new satellite device to the fleet. It starts with '
-                'full access — tune it later from Clone Access.',
-                style: TextStyle(
-                  color: t.panelText.withValues(alpha: 0.7),
-                  fontSize: 12.5,
-                  height: 1.35,
-                ),
-              ),
+              const SizedBox(height: 16),
+              _credentials(t),
               const SizedBox(height: 16),
               _field(t, 'NAME', _name, 'e.g. Mia', autofocus: true),
               if (_showError)
@@ -139,6 +139,58 @@ class _CreateCloneDialogState extends State<CreateCloneDialog> {
           ),
         ),
       ),
+    );
+  }
+
+  /// The sign-in credentials the master hands to the satellite operator:
+  /// the shared Business ID + this clone's freshly-assigned Clone ID.
+  Widget _credentials(AppTheme t) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: _orange.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _orange.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          Expanded(child: _idBlock(t, 'BUSINESS ID', widget.businessId)),
+          Container(
+            width: 1,
+            height: 34,
+            color: t.panelText.withValues(alpha: 0.15),
+            margin: const EdgeInsets.symmetric(horizontal: 14),
+          ),
+          Expanded(child: _idBlock(t, 'CLONE ID', widget.cloneId)),
+        ],
+      ),
+    );
+  }
+
+  Widget _idBlock(AppTheme t, String label, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: t.panelText.withValues(alpha: 0.6),
+            fontSize: 10,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.2,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          value,
+          style: TextStyle(
+            color: _orange,
+            fontSize: 17,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.5,
+          ),
+        ),
+      ],
     );
   }
 

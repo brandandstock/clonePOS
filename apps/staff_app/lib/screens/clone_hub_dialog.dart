@@ -14,16 +14,20 @@ class CloneHubDialog extends StatefulWidget {
   final AppTheme theme;
   final SubscriptionPlan plan;
   final int usedCount;
+  final String businessId;
   final VoidCallback onCreate;
   final VoidCallback onManageAccess;
+  final VoidCallback onCredentials;
   final ValueChanged<SubscriptionPlan> onPlanChange;
   const CloneHubDialog({
     super.key,
     required this.theme,
     required this.plan,
     required this.usedCount,
+    required this.businessId,
     required this.onCreate,
     required this.onManageAccess,
+    required this.onCredentials,
     required this.onPlanChange,
   });
 
@@ -82,8 +86,21 @@ class _CloneHubDialogState extends State<CloneHubDialog> {
                 const SizedBox(height: 10),
                 _planSwitcher(t, _plan),
               ],
+              const SizedBox(height: 10),
+              _businessRow(t),
               const SizedBox(height: 16),
               _createRow(t, atCapacity),
+              const SizedBox(height: 10),
+              _actionButton(
+                t,
+                icon: Icons.key_outlined,
+                label: 'Device sign-in IDs',
+                sub: 'Business + Clone IDs to pair each satellite',
+                onTap: () {
+                  Navigator.of(context).pop();
+                  widget.onCredentials();
+                },
+              ),
               const SizedBox(height: 10),
               _actionButton(
                 t,
@@ -191,6 +208,35 @@ class _CloneHubDialogState extends State<CloneHubDialog> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _businessRow(AppTheme t) {
+    return Row(
+      children: [
+        Icon(Icons.business_outlined,
+            size: 18, color: t.panelText.withValues(alpha: 0.6)),
+        const SizedBox(width: 10),
+        Text(
+          'BUSINESS ID',
+          style: TextStyle(
+            color: t.panelText.withValues(alpha: 0.55),
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.2,
+          ),
+        ),
+        const Spacer(),
+        Text(
+          widget.businessId,
+          style: const TextStyle(
+            color: _orange,
+            fontSize: 15,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.5,
+          ),
+        ),
+      ],
     );
   }
 

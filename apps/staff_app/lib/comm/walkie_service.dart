@@ -92,7 +92,11 @@ class WalkieService {
       _localStream = await navigator.mediaDevices
           .getUserMedia({'audio': true, 'video': false});
       _muteMic(true); // PTT: silent until the button is held
-      // Route audio out of the loudspeaker (walkie-talkie style).
+      // Put Android into in-communication audio mode, THEN force the
+      // loudspeaker. Without communication mode the peer connects but the
+      // REMOTE audio is never rendered — the "connected yet silent" case.
+      await Helper.setAndroidAudioConfiguration(
+          AndroidAudioConfiguration.communication);
       await Helper.setSpeakerphoneOn(true);
 
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, _port,
@@ -128,6 +132,11 @@ class WalkieService {
     _socket = null;
     await _localStream?.dispose();
     _localStream = null;
+    // Return the device to normal media audio routing after the call.
+    try {
+      await Helper.setAndroidAudioConfiguration(
+          AndroidAudioConfiguration.media);
+    } catch (_) {}
     state.value = WalkieState.off;
   }
 
@@ -275,7 +284,12 @@ class WalkieService {
           s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
       _publishPeers();
     };
-    // Remote audio auto-plays on Android via onTrack.
+    // Explicitly enable the incoming audio track so remote voice is rendered.
+    pc.onTrack = (RTCTrackEvent event) {
+      if (event.track.kind == 'audio') {
+        event.track.enabled = true;
+      }
+    };
     return pc;
   }
 
