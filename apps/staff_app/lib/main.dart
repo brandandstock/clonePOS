@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'data/role_store.dart';
@@ -7,17 +9,28 @@ import 'screens/role_chooser_screen.dart';
 import 'screens/satellite_view_screen.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  // Master runs landscape-only, per spec Section 5.1. The Master canvas is
-  // 1280x800 kiosk-mode; portrait is never a valid orientation for it.
-  // Satellite/Clone-POS client apps will override this once split off.
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
-  ]);
-  // Kiosk/dedicated-device mode — no system chrome (spec Section 5.1).
-  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-  runApp(const CloneposStaffApp());
+  // Kiosk-grade resilience: a single widget error must never take the whole
+  // POS down or flash a red error screen in front of staff/customers. Any
+  // build error renders a neutral dark surface (self-contained, so it can't
+  // itself throw), and uncaught async errors are logged, not fatal. Errors are
+  // still printed to logcat for diagnosis.
+  ErrorWidget.builder = (_) => const ColoredBox(color: Color(0xFF1A1A1A));
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    FlutterError.onError = (details) => FlutterError.presentError(details);
+    // Master runs landscape-only, per spec Section 5.1. The Master canvas is
+    // 1280x800 kiosk-mode; portrait is never a valid orientation for it.
+    // Satellite/Clone-POS client apps will override this once split off.
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    // Kiosk/dedicated-device mode — no system chrome (spec Section 5.1).
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    runApp(const CloneposStaffApp());
+  }, (error, stack) {
+    debugPrint('Uncaught (guarded): $error\n$stack');
+  });
 }
 
 class CloneposStaffApp extends StatelessWidget {

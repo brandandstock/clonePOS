@@ -46,9 +46,18 @@ class CloneLinkService {
   final ValueNotifier<CloneLinkState> linkState =
       ValueNotifier(CloneLinkState.searching);
   final ValueNotifier<LinkGrant?> grant = ValueNotifier(null);
-  // True while the master has this clone on an active call (CALL → true,
-  // CUT → false). Cleared if the link drops so a stale call can't linger.
+  // True while the voice leg is live (a call has been *accepted*). Cleared if
+  // the link drops so a stale call can't linger.
   final ValueNotifier<bool> onCall = ValueNotifier(false);
+  // Ring states, distinct from [onCall]. At most one is true at a time:
+  //   incomingCall — the master is ringing us; show Receive / Decline.
+  //   outgoingCall — we're ringing the master; awaiting their answer.
+  final ValueNotifier<bool> incomingCall = ValueNotifier(false);
+  final ValueNotifier<bool> outgoingCall = ValueNotifier(false);
+  // Master's address, learned from the source of its unicast messages, so
+  // clone→master call-control can be sent unicast — that keeps the clone from
+  // hearing its own broadcast back and re-processing it.
+  InternetAddress? _masterAddr;
 
   // ── Master side ──
   GrantResolver? _resolve;
@@ -62,6 +71,14 @@ class CloneLinkService {
   // identical — nothing downstream can tell a demo link from a real one.
   final Set<String> _demoLinked = {};
   final ValueNotifier<Set<String>> onlineClones = ValueNotifier(<String>{});
+  // The clone currently ringing the master (its id), or null — drives the
+  // incoming-call chime + Receive/Decline sheet on the POS.
+  final ValueNotifier<String?> incomingFromClone = ValueNotifier(null);
+  // Master-side call-control callbacks, set by the dashboard:
+  //   onCloneAccepted — a clone answered a master-placed call (open voice).
+  //   onCloneEnded    — a clone declined / cancelled / hung up (hang up card).
+  void Function(String cloneId)? onCloneAccepted;
+  void Function(String cloneId)? onCloneEnded;
 
   Future<bool> _bind() async {
     try {
@@ -98,14 +115,54 @@ class CloneLinkService {
     }
   }
 
-  /// Dial ([on] = true) or hang up ([on] = false) a specific clone. Sent
-  /// unicast to the clone's last-known address; a no-op if the clone isn't
-  /// currently linked (you can only dial a device that's signed in).
+  /// Ring ([on] = true) or hang up / cancel ([on] = false) a specific clone.
+  /// A ring is an *invitation*: the clone rings and voice starts only when it
+  /// taps Receive (which sends back `accept`). Sent unicast to the clone's
+  /// last-known address; a no-op if the clone isn't currently linked.
   void callClone(String cloneId, bool on) {
     if (!_isMaster) return;
     final entry = _live[cloneId];
     if (entry == null) return;
-    _send({'t': 'call', 'clone': cloneId, 'on': on}, entry.$1);
+    _send(
+      on
+          ? {'t': 'ring', 'dir': 'to_clone', 'clone': cloneId, 'name': 'Master'}
+          : {'t': 'decline', 'clone': cloneId},
+      entry.$1,
+    );
+  }
+
+  /// Answer a clone that is ringing us (a clone-placed call): tell it to go
+  /// voice and clear the incoming-call state.
+  void acceptClone(String cloneId) {
+    if (!_isMaster) return;
+    _send({'t': 'accept', 'clone': cloneId}, _live[cloneId]?.$1);
+    if (incomingFromClone.value == cloneId) incomingFromClone.value = null;
+  }
+
+  /// Decline a clone that is ringing us, or hang up an active clone-placed call.
+  void declineClone(String cloneId) {
+    if (!_isMaster) return;
+    _send({'t': 'decline', 'clone': cloneId}, _live[cloneId]?.$1);
+    if (incomingFromClone.value == cloneId) incomingFromClone.value = null;
+  }
+
+  // Route the clone→master call-control messages (a clone dialling in, or
+  // answering / ending a master-placed call).
+  void _onMasterCallControl(Map<String, dynamic> msg) {
+    final clone = msg['clone'] as String?;
+    if (clone == null) return;
+    switch (msg['t']) {
+      case 'ring':
+        if (msg['dir'] == 'to_master') incomingFromClone.value = clone;
+        break;
+      case 'accept':
+        onCloneAccepted?.call(clone);
+        break;
+      case 'decline':
+        if (incomingFromClone.value == clone) incomingFromClone.value = null;
+        onCloneEnded?.call(clone);
+        break;
+    }
   }
 
   void _answer(String cloneId, InternetAddress to) {
@@ -198,19 +255,86 @@ class CloneLinkService {
         _lastGrant != null &&
         DateTime.now().difference(_lastGrant!) > _onlineTtl) {
       linkState.value = CloneLinkState.searching;
-      onCall.value = false; // lost the master → drop any active call
+      // Lost the master → drop any active or pending call.
+      onCall.value = false;
+      incomingCall.value = false;
+      outgoingCall.value = false;
     }
     _send({'t': 'login', 'biz': _biz, 'clone': _clone});
   }
 
-  void _onCloneMsg(Map<String, dynamic> msg) {
+  // ── Clone-side call actions ───────────────────────────────────────
+
+  /// Ring the master (a clone-placed call). The master rings; voice starts
+  /// when it answers (we receive `accept`).
+  void callMaster() {
+    if (_isMaster) return;
+    outgoingCall.value = true;
+    incomingCall.value = false;
+    _sendToMaster({
+      't': 'ring',
+      'dir': 'to_master',
+      'clone': _clone,
+      'name': grant.value?.name ?? _clone,
+    });
+  }
+
+  /// Answer the master's incoming ring — go voice.
+  void acceptIncoming() {
+    if (_isMaster || !incomingCall.value) return;
+    incomingCall.value = false;
+    onCall.value = true; // the satellite screen opens the mic off this
+    _sendToMaster({'t': 'accept', 'clone': _clone});
+  }
+
+  /// Decline the master's incoming ring.
+  void declineIncoming() {
+    if (_isMaster) return;
+    incomingCall.value = false;
+    _sendToMaster({'t': 'decline', 'clone': _clone});
+  }
+
+  /// Hang up an active call, or cancel one we're placing.
+  void hangUp() {
+    if (_isMaster) return;
+    onCall.value = false;
+    outgoingCall.value = false;
+    incomingCall.value = false;
+    _sendToMaster({'t': 'decline', 'clone': _clone});
+  }
+
+  void _sendToMaster(Map<String, dynamic> msg) => _send(msg, _masterAddr);
+
+  void _onCloneMsg(Map<String, dynamic> msg, InternetAddress from) {
     if (msg['clone'] != _clone) return;
-    // Master dialling this clone (CALL) or hanging up (CUT).
-    if (msg['t'] == 'call') {
-      onCall.value = msg['on'] == true;
-      return;
+    switch (msg['t']) {
+      case 'ring':
+        // Only an invite *to us* rings. Ignore the echo of our own to_master
+        // broadcast entirely — learning _masterAddr from it would point us at
+        // our own address and silently break accept/decline delivery.
+        if (msg['dir'] == 'to_clone') {
+          _masterAddr = from;
+          if (!onCall.value) incomingCall.value = true;
+        }
+        return;
+      case 'accept': // master answered the call we placed
+        _masterAddr = from;
+        incomingCall.value = false;
+        outgoingCall.value = false;
+        onCall.value = true;
+        return;
+      case 'decline': // master declined / cancelled / hung up
+        _masterAddr = from;
+        incomingCall.value = false;
+        outgoingCall.value = false;
+        onCall.value = false;
+        return;
+      case 'grant':
+        _masterAddr = from;
+        break;
+      default:
+        return;
     }
-    if (msg['t'] != 'grant') return;
     _lastGrant = DateTime.now();
     if (msg['ok'] == true) {
       grant.value = LinkGrant(
@@ -238,11 +362,14 @@ class CloneLinkService {
       return;
     }
     if (_isMaster) {
-      if (msg['t'] == 'login' || msg['t'] == 'ping') {
+      final t = msg['t'];
+      if (t == 'login' || t == 'ping') {
         _onMasterMsg(msg, dg.address);
+      } else if (t == 'ring' || t == 'accept' || t == 'decline') {
+        _onMasterCallControl(msg);
       }
     } else {
-      _onCloneMsg(msg);
+      _onCloneMsg(msg, dg.address);
     }
   }
 
@@ -262,7 +389,11 @@ class CloneLinkService {
     _socket = null;
     _live.clear();
     _demoLinked.clear();
+    _masterAddr = null;
     onCall.value = false;
+    incomingCall.value = false;
+    outgoingCall.value = false;
+    incomingFromClone.value = null;
   }
 
   void dispose() {
@@ -270,6 +401,9 @@ class CloneLinkService {
     linkState.dispose();
     grant.dispose();
     onCall.dispose();
+    incomingCall.dispose();
+    outgoingCall.dispose();
     onlineClones.dispose();
+    incomingFromClone.dispose();
   }
 }

@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// A peer (Master or Satellite) discovered on the LAN.
 class WalkiePeer {
@@ -15,6 +16,9 @@ class WalkiePeer {
   DateTime lastSeen;
   RTCPeerConnection? pc;
   bool connected;
+  // When we last (re)sent an offer to this peer — used to retry a handshake
+  // whose offer/answer/ICE was lost on a weak link, without hammering it.
+  DateTime? lastDialAt;
   WalkiePeer({
     required this.id,
     required this.name,
@@ -44,8 +48,29 @@ class WalkieService {
   WalkieService({String? name}) : selfName = name ?? 'Master';
 
   static const int _port = 47771;
-  static const Duration _announceEvery = Duration(seconds: 2);
-  static const Duration _peerTtl = Duration(seconds: 8);
+  // Weak-WiFi resilient: announce often, but only reap a peer after a long
+  // silence. On a couple of signal bars, broadcast `hello`s get dropped — an
+  // 8s TTL would reap a still-present peer mid-call and cut the voice. A 1s
+  // announce with a 20s TTL tolerates losing many hellos in a row.
+  static const Duration _announceEvery = Duration(seconds: 1);
+  static const Duration _peerTtl = Duration(seconds: 20);
+  // How often to sweep for stale peers (decoupled from the TTL above).
+  static const Duration _reapEvery = Duration(seconds: 4);
+  // Retry an un-connected handshake. On a weak link the single-shot
+  // offer/answer/ICE can be lost; re-offering with a fresh connection until the
+  // media actually connects is what makes voice come up at range. The cooldown
+  // is deliberately generous: at range ICE needs several seconds of its own
+  // retransmits to succeed, so we must NOT re-dial and tear that down early —
+  // the retry loop is only a backstop for a handshake that never progresses.
+  // A definitively-failed connection is re-dialed immediately (see
+  // [_resetPeerConn]), so the cooldown never delays recovery from a real drop.
+  static const Duration _retryEvery = Duration(seconds: 2);
+  static const Duration _dialCooldown = Duration(seconds: 9);
+  // Audio send cap for weak-link robustness (clear mono voice, low break-up).
+  static const int _voiceMaxBitrate = 32000;
+  // Remote playback gain. The in-call stream is quiet by default; the native
+  // range tops out ~10, so this is a strong (but non-distorting) boost.
+  static const double _remoteVolume = 10;
 
   final String selfId = _randomId();
   String selfName;
@@ -62,6 +87,7 @@ class WalkieService {
   MediaStream? _localStream;
   Timer? _announceTimer;
   Timer? _reapTimer;
+  Timer? _retryTimer;
 
   // Loopback self-test pair.
   RTCPeerConnection? _lbA;
@@ -106,7 +132,16 @@ class WalkieService {
 
       _announce();
       _announceTimer = Timer.periodic(_announceEvery, (_) => _announce());
-      _reapTimer = Timer.periodic(_peerTtl, (_) => _reapStalePeers());
+      _reapTimer = Timer.periodic(_reapEvery, (_) => _reapStalePeers());
+      _retryTimer = Timer.periodic(_retryEvery, (_) => _retryUnconnected());
+
+      // Hold the screen awake for the whole session. On MIUI the default
+      // ~1-minute display timeout drops WiFi into power-save, which stalls the
+      // LAN heartbeats and gets the voice leg reaped — the "cuts after a
+      // minute" bug. Best-effort: never let a wakelock failure abort start-up.
+      try {
+        await WakelockPlus.enable();
+      } catch (_) {}
 
       state.value = WalkieState.ready;
       return true;
@@ -119,12 +154,19 @@ class WalkieService {
   Future<void> stop() async {
     _announceTimer?.cancel();
     _reapTimer?.cancel();
+    _retryTimer?.cancel();
     _announceTimer = null;
     _reapTimer = null;
+    _retryTimer = null;
+    try {
+      await WakelockPlus.disable();
+    } catch (_) {}
     setTalking(false);
     await stopLoopback();
     for (final p in _peers.values) {
-      await p.pc?.close();
+      final pc = p.pc;
+      p.pc = null; // detach first so the close doesn't trigger a re-dial
+      await pc?.close();
     }
     _peers.clear();
     _publishPeers();
@@ -206,6 +248,20 @@ class WalkieService {
     sock.send(data, to ?? InternetAddress('255.255.255.255'), _port);
   }
 
+  // Send a small signaling message [times] over, spaced out, so a lost packet
+  // on a weak link doesn't sink the whole handshake. Used for the answer and
+  // ICE candidates — the make-or-break packets when only a couple of host
+  // candidates exist. (Offers are NOT sent this way: a duplicate offer resets
+  // the answer side; offer loss is covered by the re-dial retry instead.)
+  void _sendReliable(Map<String, dynamic> msg, InternetAddress? to,
+      {int times = 3}) {
+    _send(msg, to);
+    for (var i = 1; i < times; i++) {
+      Future<void>.delayed(
+          Duration(milliseconds: 45 * i), () => _send(msg, to));
+    }
+  }
+
   void _onSocketEvent(RawSocketEvent event) {
     if (event != RawSocketEvent.read) return;
     final dg = _socket?.receive();
@@ -226,7 +282,7 @@ class WalkieService {
         _onHello(from, (msg['name'] as String?) ?? 'Clone', dg.address);
         break;
       case 'offer':
-        _onOffer(from, msg);
+        _onOffer(from, msg, dg.address);
         break;
       case 'answer':
         _onAnswer(from, msg);
@@ -271,7 +327,7 @@ class WalkieService {
     }
     pc.onIceCandidate = (c) {
       if (c.candidate != null) {
-        _send({
+        _sendReliable({
           't': 'ice',
           'id': selfId,
           'to': peer.id,
@@ -280,20 +336,46 @@ class WalkieService {
       }
     };
     pc.onConnectionState = (s) {
-      peer.connected =
+      final connected =
           s == RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+      peer.connected = connected;
       _publishPeers();
+      if (connected) {
+        // Re-assert loudspeaker + communication routing now that media flows.
+        // The incoming-call ringtone plays on the MEDIA stream just before the
+        // call connects, and on some devices that leaves the route on media /
+        // earpiece so the connected call is silent — this forces it back.
+        _forceCallAudioRoute();
+        // Cap the send bitrate so a weak link isn't asked to carry more than it
+        // can — fewer/smaller packets means far less break-up at range.
+        _capSendBitrate(peer);
+      }
+      // A failed/closed leg never recovers on its own, and _ensurePc would
+      // keep handing back the dead connection — the "re-call shows connected
+      // but no voice" bug. Drop it so the next handshake re-dials fresh.
+      if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          s == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+        _resetPeerConn(peer);
+      }
     };
-    // Explicitly enable the incoming audio track so remote voice is rendered.
+    // Explicitly enable the incoming audio track so remote voice is rendered,
+    // and boost its playback — the in-call (communication) stream renders
+    // quietly by default, which is the "voice is low" complaint.
     pc.onTrack = (RTCTrackEvent event) {
       if (event.track.kind == 'audio') {
         event.track.enabled = true;
+        () async {
+          try {
+            await Helper.setVolume(_remoteVolume, event.track);
+          } catch (_) {}
+        }();
       }
     };
     return pc;
   }
 
   Future<void> _dial(WalkiePeer peer) async {
+    peer.lastDialAt = DateTime.now();
     final pc = await _ensurePc(peer);
     final offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -306,39 +388,143 @@ class WalkieService {
     }, peer.address);
   }
 
-  Future<void> _onOffer(String from, Map<String, dynamic> msg) async {
-    final peer = _peers[from];
-    if (peer == null) return;
+  Future<void> _onOffer(
+      String from, Map<String, dynamic> msg, InternetAddress addr) async {
+    // Create the peer if the offer beat its `hello` here (discovery race on a
+    // lossy link) so an offer is never dropped for a not-yet-known peer.
+    var peer = _peers[from];
+    if (peer == null) {
+      peer = WalkiePeer(
+          id: from, name: 'Clone', address: addr, lastSeen: DateTime.now());
+      _peers[from] = peer;
+    } else {
+      peer
+        ..address = addr
+        ..lastSeen = DateTime.now();
+    }
+    // Answer each offer on a FRESH connection: a retried offer (the far side
+    // re-dialing after a lost packet) then always starts a clean negotiation
+    // instead of colliding with a half-open one.
+    final old = peer.pc;
+    if (old != null) {
+      peer.pc = null;
+      await old.close();
+    }
     final pc = await _ensurePc(peer);
     await pc.setRemoteDescription(
         RTCSessionDescription(msg['sdp'] as String?, msg['type'] as String?));
     final answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    _send({
+    _sendReliable({
       't': 'answer',
       'id': selfId,
       'to': from,
       'sdp': answer.sdp,
       'type': answer.type,
     }, peer.address);
+    _publishPeers();
+  }
+
+  // Retry any handshake that hasn't reached "connected" yet — the fix for
+  // voice not coming up at range. Only the deterministic offerer retries, at
+  // most once per [_dialCooldown], re-dialing on a fresh connection.
+  void _retryUnconnected() {
+    final now = DateTime.now();
+    for (final peer in _peers.values) {
+      if (peer.connected) continue;
+      if (selfId.compareTo(peer.id) >= 0) continue; // we're the answerer here
+      final last = peer.lastDialAt;
+      if (last != null && now.difference(last) < _dialCooldown) continue;
+      _redial(peer);
+    }
+  }
+
+  Future<void> _redial(WalkiePeer peer) async {
+    final old = peer.pc;
+    if (old != null) {
+      peer.pc = null;
+      await old.close();
+    }
+    await _dial(peer);
   }
 
   Future<void> _onAnswer(String from, Map<String, dynamic> msg) async {
     final pc = _peers[from]?.pc;
     if (pc == null) return;
-    await pc.setRemoteDescription(
-        RTCSessionDescription(msg['sdp'] as String?, msg['type'] as String?));
+    // A retry can leave a late answer that belongs to a superseded offer; if
+    // it doesn't fit this connection's state, ignore it — the next retry
+    // reconciles both sides. Never let it throw uncaught.
+    try {
+      await pc.setRemoteDescription(
+          RTCSessionDescription(msg['sdp'] as String?, msg['type'] as String?));
+    } catch (_) {}
   }
 
   Future<void> _onIce(String from, Map<String, dynamic> msg) async {
     final pc = _peers[from]?.pc;
     final c = msg['candidate'] as Map<String, dynamic>?;
     if (pc == null || c == null) return;
-    await pc.addCandidate(RTCIceCandidate(
-      c['candidate'] as String?,
-      c['sdpMid'] as String?,
-      c['sdpMLineIndex'] as int?,
-    ));
+    // Candidates for a torn-down/retried connection are harmless to drop.
+    try {
+      await pc.addCandidate(RTCIceCandidate(
+        c['candidate'] as String?,
+        c['sdpMid'] as String?,
+        c['sdpMLineIndex'] as int?,
+      ));
+    } catch (_) {}
+  }
+
+  // Force the call onto the loudspeaker in communication mode. Called both at
+  // start and again once a peer connects, to override any media/earpiece route
+  // the incoming-call ringtone may have left behind. Best-effort.
+  Future<void> _forceCallAudioRoute() async {
+    try {
+      await Helper.setAndroidAudioConfiguration(
+          AndroidAudioConfiguration.communication);
+      await Helper.setSpeakerphoneOn(true);
+    } catch (_) {}
+  }
+
+  // Cap this peer's audio send bitrate. 32 kbps is clear mono voice yet light
+  // enough to hold together on a weak (~2-bar) link where a higher rate breaks
+  // up. Applied via setParameters (post-connection) so it can't disturb the SDP
+  // negotiation. Best-effort.
+  Future<void> _capSendBitrate(WalkiePeer peer) async {
+    final pc = peer.pc;
+    if (pc == null) return;
+    try {
+      final senders = await pc.getSenders();
+      for (final s in senders) {
+        if (s.track?.kind != 'audio') continue;
+        final params = s.parameters;
+        final encs = params.encodings ?? <RTCRtpEncoding>[];
+        if (encs.isEmpty) {
+          encs.add(RTCRtpEncoding(maxBitrate: _voiceMaxBitrate));
+        } else {
+          for (final e in encs) {
+            e.maxBitrate = _voiceMaxBitrate;
+          }
+        }
+        params.encodings = encs;
+        await s.setParameters(params);
+      }
+    } catch (_) {}
+  }
+
+  // Tear down a dead peer connection and, if the peer is still present, re-dial
+  // from the deterministic offerer so voice returns without a manual re-call.
+  // The pc is detached before closing so nothing (including the close-triggered
+  // onConnectionState) reuses or double-heals it.
+  void _resetPeerConn(WalkiePeer peer) {
+    final pc = peer.pc;
+    if (pc == null) return;
+    peer.pc = null;
+    peer.connected = false;
+    pc.close();
+    _publishPeers();
+    if (_peers.containsKey(peer.id) && selfId.compareTo(peer.id) < 0) {
+      _dial(peer);
+    }
   }
 
   void _reapStalePeers() {
@@ -348,7 +534,9 @@ class WalkieService {
         .toList();
     if (gone.isEmpty) return;
     for (final p in gone) {
-      p.pc?.close();
+      final pc = p.pc;
+      p.pc = null; // detach first so the close doesn't trigger a re-dial
+      pc?.close();
       _peers.remove(p.id);
     }
     _publishPeers();

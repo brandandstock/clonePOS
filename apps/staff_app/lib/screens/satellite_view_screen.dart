@@ -5,7 +5,12 @@ import 'package:material_symbols_icons/symbols.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../comm/clone_link_service.dart';
+import '../comm/ringtone_service.dart';
 import '../comm/walkie_service.dart';
+import 'active_carts_view.dart';
+import 'inventory_browser.dart';
+import 'master_dashboard_screen.dart' show AppTheme;
+import 'sales_kit_opened_view.dart';
 
 const Color _orange = Color(0xFFE87722);
 const Color _green = Color(0xFF2ECC71);
@@ -60,10 +65,15 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   WalkieService? _walkie;
   bool _micMuted = false;
 
+  // Incoming-call chime (master ringing this clone).
+  final RingtoneService _ring = RingtoneService();
+
   @override
   void initState() {
     super.initState();
     _link.onCall.addListener(_onCallChanged);
+    _link.incomingCall.addListener(_onIncomingChanged);
+    _link.outgoingCall.addListener(_onRingStateChanged);
     _link.startClone(
       businessId: widget.businessId,
       cloneId: widget.cloneId,
@@ -76,6 +86,7 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
 
   void _onCallChanged() {
     if (_link.onCall.value) {
+      _ring.stop(); // answered — silence any ring
       _callSeconds = 0;
       _callTimer?.cancel();
       _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -87,6 +98,21 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
       _callTimer = null;
       _stopVoice();
     }
+    if (mounted) setState(() {});
+  }
+
+  // Master is ringing us: chime + Receive/Decline banner. If it rings the full
+  // 30s unanswered, it's a missed call — decline it so the master hangs up.
+  void _onIncomingChanged() {
+    if (_link.incomingCall.value) {
+      _ring.start(onTimeout: _link.declineIncoming);
+    } else {
+      _ring.stop();
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _onRingStateChanged() {
     if (mounted) setState(() {});
   }
 
@@ -131,6 +157,9 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   void dispose() {
     _callTimer?.cancel();
     _link.onCall.removeListener(_onCallChanged);
+    _link.incomingCall.removeListener(_onIncomingChanged);
+    _link.outgoingCall.removeListener(_onRingStateChanged);
+    _ring.dispose();
     _walkie?.dispose();
     _link.dispose();
     super.dispose();
@@ -256,7 +285,12 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
     return Column(
       children: [
         _header(grant),
-        if (_link.onCall.value) _callBanner(),
+        if (_link.incomingCall.value)
+          _incomingBanner()
+        else if (_link.outgoingCall.value)
+          _outgoingBanner()
+        else if (_link.onCall.value)
+          _callBanner(),
         Expanded(
           child: grant.features.isEmpty
               ? Center(
@@ -330,6 +364,25 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
             ),
           ),
           const SizedBox(width: 16),
+          // Call the master POS. Hidden while a call is already ringing or
+          // live — those states own the banner below.
+          if (!_link.onCall.value &&
+              !_link.incomingCall.value &&
+              !_link.outgoingCall.value) ...[
+            FilledButton.icon(
+              onPressed: _link.callMaster,
+              style: FilledButton.styleFrom(
+                backgroundColor: _callGreen,
+                foregroundColor: Colors.white,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              ),
+              icon: const Icon(Symbols.call, size: 18),
+              label: const Text('Call master',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            const SizedBox(width: 12),
+          ],
           OutlinedButton.icon(
             onPressed: widget.onSignOut,
             style: OutlinedButton.styleFrom(
@@ -411,7 +464,140 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
           // Circular mic button — the clone's control, mirroring the master's
           // CALL/CUT button. Green = live mic, red = muted.
           _micButton(denied: denied, connecting: connecting),
+          const SizedBox(width: 12),
+          // Hang up the call from the clone side.
+          _roundBtn(
+              color: _cutRed,
+              icon: Symbols.call_end,
+              label: 'END',
+              onTap: _link.hangUp),
         ],
+      ),
+    );
+  }
+
+  // Master is ringing this clone — Receive to answer, Decline to reject.
+  Widget _incomingBanner() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+      padding: const EdgeInsets.fromLTRB(20, 14, 14, 14),
+      decoration: BoxDecoration(
+        color: _cardLive,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          const Icon(Symbols.ring_volume, color: _cardText, size: 30),
+          const SizedBox(width: 14),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('INCOMING CALL',
+                    style: TextStyle(
+                        color: _cardText,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1)),
+                SizedBox(height: 2),
+                Text('Master',
+                    style: TextStyle(
+                        color: _cardText,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700)),
+              ],
+            ),
+          ),
+          _roundBtn(
+              color: _cutRed,
+              icon: Symbols.call_end,
+              label: 'DECLINE',
+              onTap: _link.declineIncoming),
+          const SizedBox(width: 12),
+          _roundBtn(
+              color: _callGreen,
+              icon: Symbols.call,
+              label: 'RECEIVE',
+              onTap: _link.acceptIncoming),
+        ],
+      ),
+    );
+  }
+
+  // We're ringing the master — waiting for an answer; Cancel to abort.
+  Widget _outgoingBanner() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+      padding: const EdgeInsets.fromLTRB(20, 14, 14, 14),
+      decoration: BoxDecoration(
+        color: _cardLive,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          const Icon(Symbols.call_made, color: _cardText, size: 28),
+          const SizedBox(width: 14),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('CALLING…',
+                    style: TextStyle(
+                        color: _cardText,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1)),
+                SizedBox(height: 2),
+                Text('Master',
+                    style: TextStyle(
+                        color: _cardText,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700)),
+              ],
+            ),
+          ),
+          _roundBtn(
+              color: _cutRed,
+              icon: Symbols.call_end,
+              label: 'CANCEL',
+              onTap: _link.hangUp),
+        ],
+      ),
+    );
+  }
+
+  // Small round action button shared by the call banners.
+  Widget _roundBtn({
+    required Color color,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 3,
+      shadowColor: color.withValues(alpha: 0.5),
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 60,
+          height: 60,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: Colors.white, size: 22),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 8,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1)),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -453,27 +639,138 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   }
 
   Widget _tile(String feature) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: _card,
+    return Material(
+      color: _card,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
         borderRadius: BorderRadius.circular(14),
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(_featureIcons[feature] ?? Symbols.help,
-              color: _orange, size: 40),
-          const SizedBox(height: 12),
-          Text(
-            feature,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
+        onTap: () => _openFeature(feature),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(_featureIcons[feature] ?? Symbols.help,
+                color: _orange, size: 40),
+            const SizedBox(height: 12),
+            Text(
+              feature,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Open a granted feature full-screen. The heavy views are reused from the
+  // master (Carts/Inventory/Sales Kit); features without a dedicated view yet
+  // land on a placeholder rather than a dead tap.
+  void _openFeature(String feature) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _SatelliteFeatureScreen(feature: feature),
+      ),
+    );
+  }
+}
+
+/// A granted feature opened full-screen on the satellite. Reuses the master's
+/// feature views where they exist; otherwise shows a placeholder so a granted
+/// tile always leads somewhere.
+class _SatelliteFeatureScreen extends StatelessWidget {
+  final String feature;
+  const _SatelliteFeatureScreen({required this.feature});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _bg,
+      appBar: AppBar(
+        backgroundColor: _card,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        titleSpacing: 0,
+        title: Row(
+          children: [
+            Icon(_featureIcons[feature] ?? Symbols.help,
+                color: _orange, size: 22),
+            const SizedBox(width: 10),
+            Text(
+              feature,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+      body: SafeArea(child: _body()),
+    );
+  }
+
+  Widget _body() {
+    switch (feature) {
+      case 'Carts':
+        return const Padding(
+          padding: EdgeInsets.all(16),
+          child: ActiveCartsGrid(),
+        );
+      case 'Inventory':
+        return const Padding(
+          padding: EdgeInsets.all(16),
+          child: InventoryBrowser(),
+        );
+      case 'Sales Kit':
+        // SalesKitOpenedView reads AppTheme.of(context); provide a dark one.
+        return AppTheme(
+          dark: true,
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: SalesKitOpenedView(),
           ),
-        ],
+        );
+      default:
+        return _placeholder();
+    }
+  }
+
+  Widget _placeholder() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(_featureIcons[feature] ?? Symbols.help,
+                color: _orange, size: 56),
+            const SizedBox(height: 18),
+            Text(
+              feature,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Access granted. This feature isn’t available on satellite '
+              'devices yet — it’s coming soon.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.6),
+                fontSize: 14,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -38,6 +38,13 @@ dependencies:
   # permission_handler.
   flutter_webrtc: ^0.12.5
   permission_handler: ^11.3.1
+  # Keep the screen (and thus WiFi) awake for the whole of a voice call. Without
+  # it MIUI's ~1-minute display timeout drops WiFi into power-save, the LAN
+  # heartbeats stall, and the WebRTC audio leg is reaped mid-call.
+  wakelock_plus: ^1.2.8
+  # Ringtone for incoming calls (master↔clone). Plays the bundled chime on a
+  # loop while a call rings, on both the clone and the master POS.
+  audioplayers: ^6.1.0
 
 dev_dependencies:
   flutter_test:
@@ -46,6 +53,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/audio/7eleven_door.mp3
   # Google Sans Flex is the canonical app font (see kClonePosFontFamily
   # in theme/clone_pos_theme.dart). Now shipping under the SIL Open Font
   # License (see assets/fonts/OFL.txt). One variable-font file covers

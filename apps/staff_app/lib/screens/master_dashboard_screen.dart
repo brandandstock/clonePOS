@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
 import '../comm/clone_link_service.dart';
+import '../comm/ringtone_service.dart';
 import '../comm/walkie_service.dart';
 import '../data/active_cart.dart';
 import '../data/business_store.dart';
@@ -454,6 +455,178 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     _loadRoster(); // restore the created-clone roster
     _loadFleet(); // restore any previously-online clones
     _loadAccess(); // restore the per-clone access grants
+    _wireCallSignals(); // clone→master ringing + accept/decline
+  }
+
+  // Incoming-call chime for a clone dialling the master POS.
+  final RingtoneService _ring = RingtoneService();
+
+  // Map a clone id back to its fleet slot, or null if it isn't a created clone.
+  int? _slotForClone(String cloneId) {
+    for (var i = 0; i < _cloneCount; i++) {
+      final c = _clones[i];
+      if (c != null && c.cloneId == cloneId) return i;
+    }
+    return null;
+  }
+
+  void _wireCallSignals() {
+    // A clone answered a call we placed → keep its card live + voice on.
+    _cloneLink.onCloneAccepted = (cloneId) {
+      final i = _slotForClone(cloneId);
+      if (i == null || !mounted) return;
+      setState(() {
+        _selectedClone = i;
+        _cloneStatus[i] = _CloneStatus.online;
+      });
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    };
+    // A clone declined / cancelled / hung up → hang up its card.
+    _cloneLink.onCloneEnded = (cloneId) {
+      _ring.stop();
+      final i = _slotForClone(cloneId);
+      if (i == null || !mounted) return;
+      setState(() => _disconnect(i));
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    };
+    // A clone is ringing the master → chime + Receive/Decline sheet.
+    _cloneLink.incomingFromClone.addListener(_onIncomingFromClone);
+  }
+
+  // A clone rings the master (or stops): drive only the chime here. The
+  // Receive/Decline UI is an in-tree banner (see build's Stack + [_incomingCallBanner]),
+  // NOT a modal dialog route — the dialog route was crashing the master on-device.
+  void _onIncomingFromClone() {
+    final cloneId = _cloneLink.incomingFromClone.value;
+    if (cloneId == null) {
+      _ring.stop();
+    } else {
+      _ring.start(onTimeout: () => _cloneLink.declineClone(cloneId)); // missed
+    }
+    if (mounted) setState(() {}); // refresh the banner
+  }
+
+  void _acceptIncoming(String cloneId) {
+    _cloneLink.acceptClone(cloneId);
+    final slot = _slotForClone(cloneId);
+    if (slot != null && mounted) {
+      setState(() {
+        _selectedClone = slot;
+        _cloneStatus[slot] = _CloneStatus.online;
+        _cloneElapsed[slot].value = 0;
+      });
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    }
+  }
+
+  // Incoming-call banner for a clone dialling in. Rendered in the dashboard's
+  // own widget tree (no modal route), mirroring the clone's incoming banner.
+  Widget _incomingCallBanner(String cloneId) {
+    const cardLive = Color(0xFFF4C75D); // mustard live card
+    const cardText = Color(0xFF63605B);
+    final i = _slotForClone(cloneId);
+    final name = i != null ? (_clones[i]?.name ?? cloneId) : cloneId;
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        child: Center(
+          child: Container(
+            margin: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(20, 14, 14, 14),
+            constraints: const BoxConstraints(maxWidth: 560),
+            decoration: BoxDecoration(
+              color: cardLive,
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6)),
+              ],
+            ),
+            child: Row(
+              children: [
+                const Icon(Symbols.ring_volume, color: cardText, size: 30),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('INCOMING CALL',
+                          style: TextStyle(
+                              color: cardText,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1)),
+                      const SizedBox(height: 2),
+                      Text(name,
+                          style: const TextStyle(
+                              color: cardText,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+                _callRoundBtn(
+                    color: const Color(0xFFF64900),
+                    icon: Symbols.call_end,
+                    label: 'DECLINE',
+                    onTap: () => _cloneLink.declineClone(cloneId)),
+                const SizedBox(width: 12),
+                _callRoundBtn(
+                    color: const Color(0xFF00C700),
+                    icon: Symbols.call,
+                    label: 'RECEIVE',
+                    onTap: () => _acceptIncoming(cloneId)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _callRoundBtn({
+    required Color color,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 3,
+      shadowColor: color.withValues(alpha: 0.5),
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 58,
+          height: 58,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: Colors.white, size: 20),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 8,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1)),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _loadPlan() async {
@@ -861,6 +1034,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
     _clonesGridCtrl.dispose();
+    _cloneLink.incomingFromClone.removeListener(_onIncomingFromClone);
+    _ring.dispose();
     _cloneLink.dispose();
     _cloneTicker?.cancel();
     for (final t in _connectTimers) {
@@ -1314,6 +1489,10 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               ),
             ),
           ),
+          // Incoming-call banner overlay — top layer, in-tree (no modal route),
+          // so a clone dialling the master is answerable from any screen.
+          if (_cloneLink.incomingFromClone.value != null)
+            _incomingCallBanner(_cloneLink.incomingFromClone.value!),
           ],
         ),
       ),
