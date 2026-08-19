@@ -23,6 +23,11 @@ class ProductStore {
     return File('${dir.path}/$_fileName');
   }
 
+  /// The backing catalog file. Exposed so the LAN catalog server
+  /// ([CatalogSyncService]) can stream/stat it directly without re-encoding,
+  /// and so a clone can persist a synced catalog through the same path.
+  Future<File> file() => _file();
+
   /// Loads the persisted catalog, seeding + writing it on first run.
   Future<List<Product>> load() async {
     try {

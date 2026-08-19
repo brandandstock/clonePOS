@@ -35,8 +35,11 @@ class Product {
 
   /// Raw image bytes for products whose photo was uploaded from the device
   /// (Inventory → Add product) rather than referenced by URL. When present it
-  /// takes priority over [imageUrl] at render time. In-memory only — not
-  /// persisted, so it survives just for the current session.
+  /// takes priority over [imageUrl] at render time. Persisted base64-encoded
+  /// inside the catalog JSON (see [toJson]/[fromJson]) so uploaded photos
+  /// survive a restart. NOTE: this is what bloats the catalog file — every
+  /// uploaded image is inlined and the whole file is rewritten on each edit;
+  /// prefer file-per-image or object storage when this moves to a real DB.
   final Uint8List? imageBytes;
 
   const Product({

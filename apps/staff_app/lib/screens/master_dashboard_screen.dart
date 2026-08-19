@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
+import '../comm/catalog_sync_service.dart';
 import '../comm/clone_link_service.dart';
 import '../comm/ringtone_service.dart';
 import '../comm/walkie_service.dart';
@@ -373,6 +374,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // the Business ID is known. (A master-side "who's linked" indicator can read
   // _cloneLink.onlineClones later.)
   final CloneLinkService _cloneLink = CloneLinkService();
+  // LAN catalog server — lets linked clones mirror this master's Inventory.
+  final CatalogSyncService _catalogSync = CatalogSyncService();
 
   Future<void> _loadBusiness() async {
     var id = await _businessStore.load();
@@ -383,6 +386,9 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     if (!mounted) return;
     setState(() => _businessId = id!);
     _cloneLink.startMaster(businessId: _businessId, resolve: _resolveGrant);
+    // Serve our live Inventory to linked clones over the LAN so their
+    // Inventory tab mirrors the master's (imports, edits, deletions).
+    _catalogSync.startMaster();
   }
 
   /// Master-side pairing resolver: a satellite is granted iff its Business ID
@@ -1037,6 +1043,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
     _cloneLink.incomingFromClone.removeListener(_onIncomingFromClone);
     _ring.dispose();
     _cloneLink.dispose();
+    _catalogSync.stop();
     _cloneTicker?.cancel();
     for (final t in _connectTimers) {
       t?.cancel();

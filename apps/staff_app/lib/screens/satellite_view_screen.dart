@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:clone_pos_core/models/product.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../comm/catalog_sync_service.dart';
 import '../comm/clone_link_service.dart';
 import '../comm/ringtone_service.dart';
 import '../comm/walkie_service.dart';
@@ -68,12 +70,22 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   // Incoming-call chime (master ringing this clone).
   final RingtoneService _ring = RingtoneService();
 
+  // Live mirror of the master's Inventory, pulled over the LAN once linked.
+  // Null until the first successful sync — Inventory then falls back to seed
+  // data. Passed into InventoryBrowser so the clone shows the master's catalog
+  // (imports, edits, deletions) instead of its own bundled seed.
+  List<Product>? _catalog;
+  String? _catVersion;
+  bool _syncing = false;
+  Timer? _catalogPoll;
+
   @override
   void initState() {
     super.initState();
     _link.onCall.addListener(_onCallChanged);
     _link.incomingCall.addListener(_onIncomingChanged);
     _link.outgoingCall.addListener(_onRingStateChanged);
+    _link.linkState.addListener(_onLinkStateChanged);
     _link.startClone(
       businessId: widget.businessId,
       cloneId: widget.cloneId,
@@ -116,6 +128,41 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
     if (mounted) setState(() {});
   }
 
+  // Once linked, pull the master's catalog and keep it fresh. A cheap version
+  // token (file size + mtime) is polled every few seconds; the full catalog is
+  // re-downloaded only when that token changes.
+  void _onLinkStateChanged() {
+    if (_link.linkState.value == CloneLinkState.connected) {
+      _syncCatalog(); // immediate first pull
+      _catalogPoll ??= Timer.periodic(
+          const Duration(seconds: 4), (_) => _syncCatalog());
+    } else {
+      _catalogPoll?.cancel();
+      _catalogPoll = null;
+      _catVersion = null; // force a fresh pull on the next link
+    }
+  }
+
+  Future<void> _syncCatalog() async {
+    final addr = _link.masterAddress;
+    if (addr == null || _syncing) return;
+    _syncing = true;
+    try {
+      final ver = await CatalogSyncService.fetchVersion(addr);
+      // Unchanged since our last successful pull — skip the heavy download.
+      if (ver != null && ver == _catVersion && _catalog != null) return;
+      final products = await CatalogSyncService.fetchCatalog(addr);
+      if (products != null && mounted) {
+        setState(() {
+          _catalog = products;
+          _catVersion = ver;
+        });
+      }
+    } finally {
+      _syncing = false;
+    }
+  }
+
   // Open the mic and join the voice mesh so master↔clone hear each other.
   void _startVoice() {
     _micMuted = false;
@@ -156,9 +203,11 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   @override
   void dispose() {
     _callTimer?.cancel();
+    _catalogPoll?.cancel();
     _link.onCall.removeListener(_onCallChanged);
     _link.incomingCall.removeListener(_onIncomingChanged);
     _link.outgoingCall.removeListener(_onRingStateChanged);
+    _link.linkState.removeListener(_onLinkStateChanged);
     _ring.dispose();
     _walkie?.dispose();
     _link.dispose();
@@ -672,7 +721,8 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   void _openFeature(String feature) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => _SatelliteFeatureScreen(feature: feature),
+        builder: (_) =>
+            _SatelliteFeatureScreen(feature: feature, products: _catalog),
       ),
     );
   }
@@ -683,7 +733,9 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
 /// tile always leads somewhere.
 class _SatelliteFeatureScreen extends StatelessWidget {
   final String feature;
-  const _SatelliteFeatureScreen({required this.feature});
+  // The master's synced catalog (null → Inventory falls back to seed data).
+  final List<Product>? products;
+  const _SatelliteFeatureScreen({required this.feature, this.products});
 
   @override
   Widget build(BuildContext context) {
@@ -722,9 +774,9 @@ class _SatelliteFeatureScreen extends StatelessWidget {
           child: ActiveCartsGrid(),
         );
       case 'Inventory':
-        return const Padding(
-          padding: EdgeInsets.all(16),
-          child: InventoryBrowser(),
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: InventoryBrowser(products: products),
         );
       case 'Sales Kit':
         // SalesKitOpenedView reads AppTheme.of(context); provide a dark one.

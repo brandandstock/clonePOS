@@ -59,6 +59,10 @@ class CloneLinkService {
   // hearing its own broadcast back and re-processing it.
   InternetAddress? _masterAddr;
 
+  /// The master's LAN address, learned once linked. Used by the catalog sync
+  /// ([CatalogSyncService]) to pull the master's Inventory over HTTP.
+  InternetAddress? get masterAddress => _masterAddr;
+
   // ── Master side ──
   GrantResolver? _resolve;
   String _businessId = '';
