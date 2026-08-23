@@ -449,21 +449,55 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
   // Active-call panel — shown while the master has this satellite on a call.
   // Styled like the master's live clone card (mustard + card text + a circular
   // CALL/CUT-style button) so both ends of the call read as one interface.
+  // The master peer on the voice mesh (there's normally just one). Prefers a
+  // connected peer, else the most-recently-heard — used for the live link
+  // readout below.
+  WalkiePeer? _primaryPeer() {
+    final list = _walkie?.peers.value ?? const <WalkiePeer>[];
+    WalkiePeer? best;
+    for (final p in list) {
+      if (best == null ||
+          (p.connected && !best.connected) ||
+          (p.connected == best.connected && p.lastSeen.isAfter(best.lastSeen))) {
+        best = p;
+      }
+    }
+    return best;
+  }
+
   Widget _callBanner() {
     final state = _walkie?.state.value;
     final denied = state == WalkieState.denied || state == WalkieState.error;
     final connecting = state == null || state == WalkieState.starting;
 
+    // Live link readout — this banner rebuilds once a second off the call
+    // clock, so these values update as you walk. `heardAgo` is the practical
+    // signal meter: 0–1s means a strong link (the master announces every 1s);
+    // it climbs as heartbeats start dropping, and the leg flips to RECONNECTING
+    // at the point voice actually breaks. Note the physical spot when it does.
+    final peer = _primaryPeer();
+    final voiceUp = peer?.connected ?? false;
+    final heardAgo =
+        peer == null ? null : DateTime.now().difference(peer.lastSeen).inSeconds;
+
     // Status line + accent, matching master-card semantics.
     final String label;
+    Color dotColor;
     if (denied) {
       label = 'MIC BLOCKED — ENABLE IN SETTINGS';
+      dotColor = _cutRed;
     } else if (connecting) {
       label = 'CONNECTING AUDIO…';
-    } else if (_micMuted) {
-      label = 'ON CALL — MUTED';
+      dotColor = _cutRed;
+    } else if (!voiceUp) {
+      label = heardAgo == null
+          ? 'RECONNECTING…'
+          : 'RECONNECTING · heard ${heardAgo}s ago';
+      dotColor = const Color(0xFFB26B00); // amber: link degraded / recovering
     } else {
-      label = 'ON CALL';
+      final base = _micMuted ? 'ON CALL — MUTED' : 'ON CALL';
+      label = heardAgo == null ? base : '$base · LINK OK · ${heardAgo}s';
+      dotColor = _callGreen;
     }
 
     return Container(
@@ -480,7 +514,7 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
             width: 12,
             height: 12,
             decoration: BoxDecoration(
-              color: connecting ? _cutRed : _callGreen,
+              color: dotColor,
               shape: BoxShape.circle,
             ),
           ),
@@ -507,6 +541,26 @@ class _SatelliteViewScreenState extends State<SatelliteViewScreen> {
                     fontWeight: FontWeight.w700,
                   ),
                 ),
+                // Live link-quality readout (packet loss / jitter) so the voice
+                // break-up can be measured on-device while walking: high loss %
+                // means it's the WiFi, not the app.
+                if (_walkie != null)
+                  ValueListenableBuilder<String>(
+                    valueListenable: _walkie!.diag,
+                    builder: (_, d, __) => d.isEmpty
+                        ? const SizedBox(height: 2)
+                        : Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              d,
+                              style: TextStyle(
+                                color: _cardText.withValues(alpha: 0.85),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                  ),
               ],
             ),
           ),

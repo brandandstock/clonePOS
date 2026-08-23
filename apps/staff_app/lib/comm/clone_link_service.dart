@@ -33,7 +33,13 @@ enum CloneLinkState { searching, connected, rejected }
 class CloneLinkService {
   static const int _port = 47772;
   static const Duration _searchEvery = Duration(milliseconds: 1500);
-  static const Duration _onlineTtl = Duration(seconds: 6);
+  // Presence/link-loss grace. Matched to the voice leg's tolerance (WalkieService
+  // holds a call ~20s of silence) so a weak cross-floor link that drops a run of
+  // heartbeats doesn't flap the clone offline or make the clone drop the call
+  // while the voice is still riding through the dip. Reaping is swept on its own
+  // faster cadence ([_reapEvery]) so a peer that truly left is still noticed.
+  static const Duration _onlineTtl = Duration(seconds: 20);
+  static const Duration _reapEvery = Duration(seconds: 4);
 
   RawDatagramSocket? _socket;
   bool _isMaster = false;
@@ -106,7 +112,7 @@ class CloneLinkService {
     _businessId = businessId;
     _resolve = resolve;
     if (!await _bind()) return false;
-    _reapTimer = Timer.periodic(_onlineTtl, (_) => _reap());
+    _reapTimer = Timer.periodic(_reapEvery, (_) => _reap());
     return true;
   }
 
@@ -125,13 +131,22 @@ class CloneLinkService {
   /// last-known address; a no-op if the clone isn't currently linked.
   void callClone(String cloneId, bool on) {
     if (!_isMaster) return;
-    final entry = _live[cloneId];
-    if (entry == null) return;
-    _send(
+    // Prefer the clone's last-known unicast address. If it briefly fell out of
+    // the live roster (a cross-floor heartbeat gap), fall back to broadcast so a
+    // hang-up still lands — the message carries `clone`, so only that clone acts
+    // on it. This is why CUT can never be silently swallowed mid-dropout.
+    final to = _live[cloneId]?.$1;
+    _sendReliable(
       on
-          ? {'t': 'ring', 'dir': 'to_clone', 'clone': cloneId, 'name': 'Master'}
-          : {'t': 'decline', 'clone': cloneId},
-      entry.$1,
+          ? {
+              't': 'ring',
+              'dir': 'to_clone',
+              'clone': cloneId,
+              'name': 'Master',
+              'from': 'master',
+            }
+          : {'t': 'decline', 'clone': cloneId, 'from': 'master'},
+      to,
     );
   }
 
@@ -139,14 +154,16 @@ class CloneLinkService {
   /// voice and clear the incoming-call state.
   void acceptClone(String cloneId) {
     if (!_isMaster) return;
-    _send({'t': 'accept', 'clone': cloneId}, _live[cloneId]?.$1);
+    _sendReliable({'t': 'accept', 'clone': cloneId, 'from': 'master'},
+        _live[cloneId]?.$1);
     if (incomingFromClone.value == cloneId) incomingFromClone.value = null;
   }
 
   /// Decline a clone that is ringing us, or hang up an active clone-placed call.
   void declineClone(String cloneId) {
     if (!_isMaster) return;
-    _send({'t': 'decline', 'clone': cloneId}, _live[cloneId]?.$1);
+    _sendReliable({'t': 'decline', 'clone': cloneId, 'from': 'master'},
+        _live[cloneId]?.$1);
     if (incomingFromClone.value == cloneId) incomingFromClone.value = null;
   }
 
@@ -307,7 +324,8 @@ class CloneLinkService {
     _sendToMaster({'t': 'decline', 'clone': _clone});
   }
 
-  void _sendToMaster(Map<String, dynamic> msg) => _send(msg, _masterAddr);
+  // All clone→master call-control (ring / accept / decline) goes out reliably.
+  void _sendToMaster(Map<String, dynamic> msg) => _sendReliable(msg, _masterAddr);
 
   void _onCloneMsg(Map<String, dynamic> msg, InternetAddress from) {
     if (msg['clone'] != _clone) return;
@@ -366,6 +384,13 @@ class CloneLinkService {
       return;
     }
     if (_isMaster) {
+      // Ignore the loopback of our OWN broadcasts. Master call-control that
+      // falls back to broadcast (a clone briefly out of the live roster) is
+      // echoed back to this socket; without this guard a broadcast `decline`
+      // (CUT) re-enters as a clone-ended event, which re-broadcasts CUT — an
+      // infinite loop. Clone→master messages never carry `from:'master'`, so
+      // only our own echoes are dropped.
+      if (msg['from'] == 'master') return;
       final t = msg['t'];
       if (t == 'login' || t == 'ping') {
         _onMasterMsg(msg, dg.address);
@@ -382,6 +407,20 @@ class CloneLinkService {
     if (sock == null) return;
     final data = utf8.encode(jsonEncode(msg));
     sock.send(data, to ?? InternetAddress('255.255.255.255'), _port);
+  }
+
+  // Send a one-shot call-control message ([times]) over, spaced out, so a single
+  // lost UDP packet on a weak link doesn't drop a ring / accept / decline —
+  // the "sometimes the ring doesn't come" case. The receivers are idempotent
+  // (they guard on current call state), so the duplicates are harmless: it
+  // rings, answers or hangs up exactly once. Heartbeats (login/ping/grant) are
+  // NOT sent this way — they already repeat on their own timer.
+  void _sendReliable(Map<String, dynamic> msg, [InternetAddress? to]) {
+    _send(msg, to);
+    for (var i = 1; i < 3; i++) {
+      Future<void>.delayed(
+          Duration(milliseconds: 45 * i), () => _send(msg, to));
+    }
   }
 
   Future<void> stop() async {
