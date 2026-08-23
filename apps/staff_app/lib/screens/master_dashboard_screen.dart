@@ -1,11 +1,25 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:clone_pos_widgets/clone_pos_widgets.dart';
+import '../comm/catalog_sync_service.dart';
+import '../comm/clone_link_service.dart';
+import '../comm/ringtone_service.dart';
+import '../comm/walkie_service.dart';
 import '../data/active_cart.dart';
+import '../data/business_store.dart';
+import '../data/clone_access_store.dart';
+import '../data/clone_fleet_store.dart';
+import '../data/clone_roster_store.dart';
+import '../data/plan_store.dart';
+import 'clone_access_dialog.dart';
+import 'clone_hub_dialog.dart';
+import 'create_clone_dialog.dart';
 import 'inventory_opened_view.dart';
+import 'walkie_dialog.dart';
 import 'sales_kit_opened_view.dart';
 
 /// ============================================================================
@@ -269,7 +283,9 @@ class _VoidFloatState extends State<_VoidFloat>
 }
 
 class MasterDashboardScreen extends StatefulWidget {
-  const MasterDashboardScreen({super.key});
+  /// Clears this device's role and returns to the role chooser (Logout).
+  final VoidCallback? onSignOut;
+  const MasterDashboardScreen({super.key, this.onSignOut});
 
   @override
   State<MasterDashboardScreen> createState() => _MasterDashboardScreenState();
@@ -307,6 +323,9 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   // scrolls the tile grid.
   final ScrollController _leftRailHorizontalCtrl = ScrollController();
   final ScrollController _rightRailVerticalCtrl = ScrollController();
+  // Vertical scroll for the Clones fleet grid (can exceed the 2 visible rows
+  // once a plan unlocks more than six slots).
+  final ScrollController _clonesGridCtrl = ScrollController();
 
   // Reference the currently-mounted InventoryOpenedView so the shared
   // chevron_back can drill up through its category/sub/product/detail
@@ -319,71 +338,914 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
   final GlobalKey<SalesKitOpenedViewState> _salesKitKey =
       GlobalKey<SalesKitOpenedViewState>();
 
+  // ── Clone access grants (per-clone) ───────────────────────────────
+  // For each created satellite, which app features the master permits it to
+  // open. Index-aligned to the fleet (0.._cloneCount-1). Edited from
+  // Settings → Clone Access, persisted via CloneAccessStore. First run
+  // (nothing saved) grants every feature to every clone.
+  final CloneAccessStore _accessStore = CloneAccessStore();
+  late List<Set<String>> _cloneAccess = List.generate(
+    _cloneCount,
+    (_) => kCloneAccessFeatures.toSet(),
+  );
+
+  // ── Clone roster (created satellites) ──────────────────────────────
+  // Which of the fixed fleet slots have been created and each one's
+  // name/department. A null slot is an empty "Create Clone" tile. Seeded
+  // from _cloneIdentities on first run; persisted via CloneRosterStore.
+  final CloneRosterStore _rosterStore = CloneRosterStore();
+  // Seed: the first six slots hold the standard fleet; the rest start empty
+  // (created on demand, up to the plan's capacity).
+  late List<CloneRecord?> _clones = [
+    for (var i = 0; i < _cloneCount; i++)
+      i < _cloneIdentities.length
+          ? CloneRecord(_cloneIdentities[i].$1, _cloneIdentities[i].$2)
+          : null,
+  ];
+
+  // ── Business identity (satellite sign-in) ──────────────────────────
+  // The shared Business ID every satellite signs in with, plus a per-clone
+  // Clone ID (on each CloneRecord). Together they pair a device to a slot and
+  // its granted permissions. Generated on first run, persisted, stable after.
+  final BusinessStore _businessStore = BusinessStore();
+  String _businessId = '';
+
+  // LAN control-plane: answers clone sign-ins with their grant. Started once
+  // the Business ID is known. (A master-side "who's linked" indicator can read
+  // _cloneLink.onlineClones later.)
+  final CloneLinkService _cloneLink = CloneLinkService();
+  // LAN catalog server — lets linked clones mirror this master's Inventory.
+  final CatalogSyncService _catalogSync = CatalogSyncService();
+
+  Future<void> _loadBusiness() async {
+    var id = await _businessStore.load();
+    if (id == null || id.isEmpty) {
+      id = randomCode(6, prefix: 'BIZ');
+      await _businessStore.save(id);
+    }
+    if (!mounted) return;
+    setState(() => _businessId = id!);
+    _cloneLink.startMaster(businessId: _businessId, resolve: _resolveGrant);
+    // Serve our live Inventory to linked clones over the LAN so their
+    // Inventory tab mirrors the master's (imports, edits, deletions).
+    _catalogSync.startMaster();
+  }
+
+  /// Master-side pairing resolver: a satellite is granted iff its Business ID
+  /// matches ours and its Clone ID belongs to a created clone. Returns that
+  /// clone's identity + currently-granted features.
+  LinkGrant? _resolveGrant(String biz, String cloneId) {
+    if (biz != _businessId) return null;
+    for (var i = 0; i < _cloneCount; i++) {
+      final c = _clones[i];
+      if (c != null && c.cloneId.isNotEmpty && c.cloneId == cloneId) {
+        return LinkGrant(c.name, c.department, _cloneAccess[i].toList());
+      }
+    }
+    return null;
+  }
+
+  /// A fresh Clone ID not already in use by another slot.
+  String _generateCloneId() {
+    final existing = {
+      for (final c in _clones)
+        if (c != null && c.cloneId.isNotEmpty) c.cloneId,
+    };
+    String id;
+    do {
+      id = randomCode(4, prefix: 'CLN');
+    } while (existing.contains(id));
+    return id;
+  }
+
+  /// Ensure every created clone has a Clone ID (seeded fleet / legacy rosters
+  /// predate the field). Backfills and persists once if any were missing.
+  void _ensureCloneIds() {
+    var changed = false;
+    for (var i = 0; i < _clones.length; i++) {
+      final c = _clones[i];
+      if (c != null && c.cloneId.isEmpty) {
+        _clones[i] = c.withCloneId(_generateCloneId());
+        changed = true;
+      }
+    }
+    if (changed) _rosterStore.save(_clones);
+  }
+
+  // ── Subscription plan (clone capacity) ─────────────────────────────
+  final PlanStore _planStore = PlanStore();
+  SubscriptionPlan _plan = SubscriptionPlan.basic;
+
+  int get _capacity => _plan.capacity;
+  int get _createdCount => _clones.where((c) => c != null).length;
+
+  /// First empty slot within the plan's capacity, or null when the plan is
+  /// full (→ create is locked, upgrade required).
+  int? _nextFreeSlot() {
+    for (var i = 0; i < _capacity && i < _cloneCount; i++) {
+      if (_clones[i] == null) return i;
+    }
+    return null;
+  }
+
+  void _setPlan(SubscriptionPlan plan) {
+    setState(() => _plan = plan);
+    _planStore.save(plan);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBusiness(); // restore/generate the Business ID
+    _loadPlan(); // restore the subscription plan (clone capacity)
+    _loadRoster(); // restore the created-clone roster
+    _loadFleet(); // restore any previously-online clones
+    _loadAccess(); // restore the per-clone access grants
+    _wireCallSignals(); // clone→master ringing + accept/decline
+  }
+
+  // Incoming-call chime for a clone dialling the master POS.
+  final RingtoneService _ring = RingtoneService();
+
+  // Map a clone id back to its fleet slot, or null if it isn't a created clone.
+  int? _slotForClone(String cloneId) {
+    for (var i = 0; i < _cloneCount; i++) {
+      final c = _clones[i];
+      if (c != null && c.cloneId == cloneId) return i;
+    }
+    return null;
+  }
+
+  void _wireCallSignals() {
+    // A clone answered a call we placed → keep its card live + voice on.
+    _cloneLink.onCloneAccepted = (cloneId) {
+      final i = _slotForClone(cloneId);
+      if (i == null || !mounted) return;
+      setState(() {
+        _selectedClone = i;
+        _cloneStatus[i] = _CloneStatus.online;
+      });
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    };
+    // A clone declined / cancelled / hung up → hang up its card.
+    _cloneLink.onCloneEnded = (cloneId) {
+      _ring.stop();
+      final i = _slotForClone(cloneId);
+      if (i == null || !mounted) return;
+      setState(() => _disconnect(i));
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    };
+    // A clone is ringing the master → chime + Receive/Decline sheet.
+    _cloneLink.incomingFromClone.addListener(_onIncomingFromClone);
+  }
+
+  // A clone rings the master (or stops): drive only the chime here. The
+  // Receive/Decline UI is an in-tree banner (see build's Stack + [_incomingCallBanner]),
+  // NOT a modal dialog route — the dialog route was crashing the master on-device.
+  void _onIncomingFromClone() {
+    final cloneId = _cloneLink.incomingFromClone.value;
+    if (cloneId == null) {
+      _ring.stop();
+    } else {
+      _ring.start(onTimeout: () => _cloneLink.declineClone(cloneId)); // missed
+    }
+    if (mounted) setState(() {}); // refresh the banner
+  }
+
+  void _acceptIncoming(String cloneId) {
+    _cloneLink.acceptClone(cloneId);
+    final slot = _slotForClone(cloneId);
+    if (slot != null && mounted) {
+      setState(() {
+        _selectedClone = slot;
+        _cloneStatus[slot] = _CloneStatus.online;
+        _cloneElapsed[slot].value = 0;
+      });
+      _syncCloneTicker();
+      _persistFleet();
+      _syncCallVoice();
+    }
+  }
+
+  // Incoming-call banner for a clone dialling in. Rendered in the dashboard's
+  // own widget tree (no modal route), mirroring the clone's incoming banner.
+  Widget _incomingCallBanner(String cloneId) {
+    const cardLive = Color(0xFFF4C75D); // mustard live card
+    const cardText = Color(0xFF63605B);
+    final i = _slotForClone(cloneId);
+    final name = i != null ? (_clones[i]?.name ?? cloneId) : cloneId;
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        child: Center(
+          child: Container(
+            margin: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(20, 14, 14, 14),
+            constraints: const BoxConstraints(maxWidth: 560),
+            decoration: BoxDecoration(
+              color: cardLive,
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6)),
+              ],
+            ),
+            child: Row(
+              children: [
+                const Icon(Symbols.ring_volume, color: cardText, size: 30),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('INCOMING CALL',
+                          style: TextStyle(
+                              color: cardText,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1)),
+                      const SizedBox(height: 2),
+                      Text(name,
+                          style: const TextStyle(
+                              color: cardText,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+                _callRoundBtn(
+                    color: const Color(0xFFF64900),
+                    icon: Symbols.call_end,
+                    label: 'DECLINE',
+                    onTap: () => _cloneLink.declineClone(cloneId)),
+                const SizedBox(width: 12),
+                _callRoundBtn(
+                    color: const Color(0xFF00C700),
+                    icon: Symbols.call,
+                    label: 'RECEIVE',
+                    onTap: () => _acceptIncoming(cloneId)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _callRoundBtn({
+    required Color color,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: color,
+      shape: const CircleBorder(),
+      elevation: 3,
+      shadowColor: color.withValues(alpha: 0.5),
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 58,
+          height: 58,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: Colors.white, size: 20),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 8,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _loadPlan() async {
+    final saved = await _planStore.load();
+    if (saved != null && mounted) setState(() => _plan = saved);
+  }
+
+  Future<void> _loadRoster() async {
+    final saved = await _rosterStore.load(_cloneCount);
+    if (mounted) {
+      setState(() {
+        if (saved != null) _clones = saved;
+        _ensureCloneIds(); // stamp IDs on the seeded/legacy fleet + persist
+      });
+    }
+  }
+
+  Future<void> _loadAccess() async {
+    final saved = await _accessStore.load(_cloneCount);
+    if (saved != null && mounted) setState(() => _cloneAccess = saved);
+  }
+
+  /// Create a clone into empty [slot]: capture a name + department, then
+  /// register it with full access and a parked (offline) session.
+  void _createCloneAt(int slot) {
+    final theme = AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+    showDialog(
+      context: context,
+      builder: (_) => CreateCloneDialog(
+        theme: theme,
+        slotNumber: slot + 1,
+        businessId: _businessId,
+        cloneId: _generateCloneId(),
+        onCreate: (record) {
+          setState(() {
+            _clones[slot] = record;
+            _cloneAccess[slot] = kCloneAccessFeatures.toSet(); // full access
+            _disconnect(slot); // ensure the slot's session starts parked
+            _selectedClone = slot;
+          });
+          _rosterStore.save(_clones);
+          _accessStore.save(_cloneAccess);
+          _cloneLink.pushUpdate();
+          _syncCloneTicker();
+          _persistFleet();
+        },
+      ),
+    );
+  }
+
+  /// Remove the clone in [slot] after confirmation, freeing it back to an
+  /// empty "Create Clone" tile and parking its session.
+  void _deleteCloneAt(int slot) {
+    final record = _clones[slot];
+    if (record == null) return;
+    final theme = AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: theme.panelBg,
+        title: Text('Remove ${record.name}?',
+            style: TextStyle(
+                color: theme.panelText, fontWeight: FontWeight.w800)),
+        content: Text(
+          'This frees slot ${slot + 1}. The clone and its access grant are '
+          'cleared; you can create a new one in its place.',
+          style: TextStyle(color: theme.panelText.withValues(alpha: 0.75)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            style: TextButton.styleFrom(foregroundColor: theme.panelText),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              setState(() {
+                _disconnect(slot); // park any live/dialling session
+                _clones[slot] = null;
+                _cloneAccess[slot] = kCloneAccessFeatures.toSet(); // reset
+                if (_selectedClone == slot) _selectedClone = null;
+              });
+              _rosterStore.save(_clones);
+              _accessStore.save(_cloneAccess);
+              _cloneLink.pushUpdate(); // a removed clone gets rejected live
+              _syncCloneTicker();
+              _persistFleet();
+            },
+            style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFA80B0B),
+                foregroundColor: Colors.white),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // AppTheme is created *inside* this State's build(), so the State's own
+  // context sits above it — AppTheme.of(context) would find nothing. Build the
+  // palette straight from _darkMode instead. (The child is unused; dialogs
+  // only read AppTheme's colour getters.)
+  AppTheme get _dialogTheme =>
+      AppTheme(dark: _darkMode, child: const SizedBox.shrink());
+
+  /// Settings → Clone Access opens the fleet HUB first: plan + usage, create
+  /// clone (capacity-gated), plan switch, and a route into feature access.
+  void _openCloneAccess() {
+    showDialog(
+      context: context,
+      builder: (_) => CloneHubDialog(
+        theme: _dialogTheme,
+        plan: _plan,
+        usedCount: _createdCount,
+        businessId: _businessId,
+        onCreate: () {
+          final slot = _nextFreeSlot();
+          if (slot != null) _createCloneAt(slot);
+        },
+        onManageAccess: _openManageAccess,
+        onCredentials: _openCredentials,
+        onPlanChange: _setPlan,
+      ),
+    );
+  }
+
+  /// Reference sheet of the sign-in IDs the master hands to each satellite:
+  /// the shared Business ID plus every created clone's Clone ID and how many
+  /// features it's currently granted.
+  void _openCredentials() {
+    final t = _dialogTheme;
+    final rows = <(String, String, int)>[
+      for (var i = 0; i < _cloneCount; i++)
+        if (_clones[i] != null)
+          (_clones[i]!.name, _clones[i]!.cloneId, _cloneAccess[i].length),
+    ];
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: t.panelBg,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 40, vertical: 16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 460,
+            maxHeight: MediaQuery.of(ctx).size.height - 32,
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 18, 22, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.key_outlined, color: _oCartsOrange),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text('Device sign-in IDs',
+                          style: TextStyle(
+                              color: t.panelText,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w800)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  'Each satellite signs in with the Business ID + its Clone ID '
+                  'to connect and receive its granted access.',
+                  style: TextStyle(
+                      color: t.panelText.withValues(alpha: 0.7),
+                      fontSize: 12.5,
+                      height: 1.35),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Text('BUSINESS ID',
+                        style: TextStyle(
+                            color: t.panelText.withValues(alpha: 0.55),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.2)),
+                    const Spacer(),
+                    Text(_businessId,
+                        style: const TextStyle(
+                            color: _oCartsOrange,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.5)),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Divider(color: t.divider, height: 1),
+                // Live device presence — a signed-in satellite shows a green
+                // dot; the summary counts how many are linked right now.
+                // Updates from link timers/packets, hence the listenable.
+                Flexible(
+                  child: ValueListenableBuilder<Set<String>>(
+                    valueListenable: _cloneLink.onlineClones,
+                    builder: (_, online, __) {
+                      bool isLinked((String, String, int) r) =>
+                          r.$2.isNotEmpty && online.contains(r.$2);
+                      final linkedCount = rows.where(isLinked).length;
+                      return SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            if (rows.isNotEmpty)
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 10),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      width: 7,
+                                      height: 7,
+                                      decoration: BoxDecoration(
+                                        color: linkedCount > 0
+                                            ? _oClonesGreen
+                                            : t.panelText
+                                                .withValues(alpha: 0.35),
+                                        shape: BoxShape.circle,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      '$linkedCount of ${rows.length} '
+                                      'device${rows.length == 1 ? '' : 's'} '
+                                      'linked',
+                                      style: TextStyle(
+                                        color:
+                                            t.panelText.withValues(alpha: 0.7),
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    Text(
+                                      'toggle = simulate (demo)',
+                                      style: TextStyle(
+                                        color:
+                                            t.panelText.withValues(alpha: 0.4),
+                                        fontSize: 10.5,
+                                        fontStyle: FontStyle.italic,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            for (final r in rows)
+                              _credentialRow(
+                                t,
+                                r,
+                                isLinked(r),
+                                (on) => _cloneLink.setDemoLinked(r.$2, on),
+                              ),
+                            if (rows.isEmpty)
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 18),
+                                child: Text('No clones created yet.',
+                                    style: TextStyle(
+                                        color: t.panelText
+                                            .withValues(alpha: 0.6))),
+                              ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    style: TextButton.styleFrom(foregroundColor: t.panelText),
+                    child: const Text('Done'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _credentialRow(
+    AppTheme t,
+    (String, String, int) r,
+    bool linked,
+    ValueChanged<bool> onDemoToggle,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      child: Row(
+        children: [
+          // Live presence dot — green when this satellite is signed in.
+          Container(
+            width: 8,
+            height: 8,
+            margin: const EdgeInsets.only(right: 12),
+            decoration: BoxDecoration(
+              color:
+                  linked ? _oClonesGreen : t.panelText.withValues(alpha: 0.3),
+              shape: BoxShape.circle,
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(r.$1,
+                    style: TextStyle(
+                        color: t.panelText,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700)),
+                Text('${r.$3}/${kCloneAccessFeatures.length} features granted',
+                    style: TextStyle(
+                        color: t.panelText.withValues(alpha: 0.6),
+                        fontSize: 11.5)),
+              ],
+            ),
+          ),
+          Text(r.$2,
+              style: const TextStyle(
+                  color: _oCartsOrange,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.5)),
+          // Demo toggle — simulate this satellite signing in so the presence
+          // dot + fleet-card LINKED pill can be shown without a 2nd device.
+          const SizedBox(width: 8),
+          Transform.scale(
+            scale: 0.72,
+            child: Switch(
+              value: linked,
+              onChanged: onDemoToggle,
+              activeThumbColor: _oClonesGreen,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Logout → confirm, then hand back to the role chooser (via _RoleGate).
+  void _handleLogout() {
+    final t = _dialogTheme;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.panelBg,
+        title: Text('Sign out?',
+            style: TextStyle(color: t.panelText, fontWeight: FontWeight.w800)),
+        content: Text(
+          'This device will return to the setup screen (Master / Clone).',
+          style: TextStyle(color: t.panelText.withValues(alpha: 0.75)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            style: TextButton.styleFrom(foregroundColor: t.panelText),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              widget.onSignOut?.call();
+            },
+            style: FilledButton.styleFrom(
+                backgroundColor: _oCartsOrange, foregroundColor: Colors.white),
+            child: const Text('Sign out'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The per-clone feature-access grant editor (reached from the hub).
+  void _openManageAccess() {
+    showDialog(
+      context: context,
+      builder: (_) => CloneAccessDialog(
+        theme: _dialogTheme,
+        granted: _cloneAccess,
+        // Null entries are empty slots — the selector skips them so only
+        // created clones are grantable, kept index-aligned to _cloneAccess.
+        cloneNames: [for (final c in _clones) c?.name],
+        onChanged: (next) {
+          setState(() => _cloneAccess = next);
+          _accessStore.save(next);
+          _cloneLink.pushUpdate(); // live-update any signed-in clones
+        },
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _leftRailHorizontalCtrl.dispose();
     _rightRailVerticalCtrl.dispose();
+    _clonesGridCtrl.dispose();
+    _cloneLink.incomingFromClone.removeListener(_onIncomingFromClone);
+    _ring.dispose();
+    _cloneLink.dispose();
+    _catalogSync.stop();
     _cloneTicker?.cancel();
+    for (final t in _connectTimers) {
+      t?.cancel();
+    }
+    for (final n in _cloneElapsed) {
+      n.dispose();
+    }
+    _walkie?.dispose();
     super.dispose();
   }
 
-  // ── Clone fleet call state ─────────────────────────────────────────
-  // Shared source of truth so the SESSIONS master control and each
-  // individual clone card drive the SAME live/timer state:
-  //   - master CALL  → every clone connects (all cards go live)
-  //   - master END   → every clone disconnects
-  //   - a card's CALL/CUT toggles just that one clone, independently
-  // A single ticker advances every live clone's clock once a second.
-  static const int _cloneCount = 6;
-  final List<bool> _cloneLive = List<bool>.filled(_cloneCount, false);
-  final List<int> _cloneElapsed = List<int>.filled(_cloneCount, 0);
+  // ── Clone fleet state (simulated Satellite sessions) ───────────────
+  // Shared source of truth so the SESSIONS master control and each clone
+  // card drive the SAME state:
+  //   - CALL a clone  → offline → connecting (~1s) → online (clock ticks)
+  //   - CUT a clone   → back to offline, clock reset
+  //   - master CALL   → dials every offline clone (staggered so they land
+  //                     one after another, like real devices joining)
+  //   - master END    → disconnects the whole fleet
+  // The state is persisted (CloneFleetStore) so online clones resume on the
+  // next launch. A single ticker advances every ONLINE clone's clock once a
+  // second via per-clone ValueNotifiers, so only the two timer labels
+  // rebuild — never the whole dashboard (that was the app-wide lag).
+  // Physical fleet-slot count = the Enterprise capacity. The active plan
+  // gates how many of these slots are actually usable (the rest are locked).
+  static const int _cloneCount = kMaxClones;
+  // Real LAN walkie-talkie (created lazily so the mic isn't requested until
+  // the user opens the walkie panel).
+  WalkieService? _walkie;
+  final CloneFleetStore _fleetStore = CloneFleetStore();
+  final List<_CloneStatus> _cloneStatus =
+      List<_CloneStatus>.filled(_cloneCount, _CloneStatus.offline);
+  final List<ValueNotifier<int>> _cloneElapsed = List<ValueNotifier<int>>
+      .generate(_cloneCount, (_) => ValueNotifier<int>(0));
+  // Per-clone connecting→online timers (the dialling delay).
+  final List<Timer?> _connectTimers = List<Timer?>.filled(_cloneCount, null);
   Timer? _cloneTicker;
 
-  bool get _anyCloneLive => _cloneLive.any((e) => e);
+  bool _isOnline(int i) => _cloneStatus[i] == _CloneStatus.online;
+  bool get _anyOnline => _cloneStatus.any((s) => s == _CloneStatus.online);
+  // Any clone not fully parked → the master button reads END.
+  bool get _anyActive =>
+      _cloneStatus.any((s) => s != _CloneStatus.offline);
+
+  Future<void> _loadFleet() async {
+    final snap = await _fleetStore.load(_cloneCount);
+    if (snap == null || !mounted) return;
+    setState(() {
+      for (var i = 0; i < _cloneCount; i++) {
+        _cloneStatus[i] =
+            snap.online[i] ? _CloneStatus.online : _CloneStatus.offline;
+        _cloneElapsed[i].value = snap.online[i] ? snap.elapsed[i] : 0;
+      }
+    });
+    _syncCloneTicker();
+  }
+
+  void _persistFleet() {
+    _fleetStore.save(
+      [for (var i = 0; i < _cloneCount; i++) _isOnline(i)],
+      [for (final n in _cloneElapsed) n.value],
+    );
+  }
 
   void _syncCloneTicker() {
-    if (_anyCloneLive && _cloneTicker == null) {
+    if (_anyOnline && _cloneTicker == null) {
       _cloneTicker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!mounted) return;
-        setState(() {
-          for (var i = 0; i < _cloneCount; i++) {
-            if (_cloneLive[i]) _cloneElapsed[i]++;
-          }
-        });
+        // Bump each online clone's notifier — no setState. Only the bound
+        // ValueListenableBuilder timer labels rebuild; if the Clones tab
+        // isn't open, nothing is listening and nothing rebuilds.
+        for (var i = 0; i < _cloneCount; i++) {
+          if (_isOnline(i)) _cloneElapsed[i].value++;
+        }
       });
-    } else if (!_anyCloneLive && _cloneTicker != null) {
+    } else if (!_anyOnline && _cloneTicker != null) {
       _cloneTicker!.cancel();
       _cloneTicker = null;
     }
   }
 
+  /// Send the real CALL/CUT signal to slot [i]'s clone over the LAN — a no-op
+  /// unless that clone is created AND currently linked (signed in). The local
+  /// card animation runs regardless; this is what actually reaches the device.
+  void _signalCall(int i, bool on) {
+    final c = _clones[i];
+    if (c != null && c.cloneId.isNotEmpty) _cloneLink.callClone(c.cloneId, on);
+  }
+
+  // Start dialling clone [i]; it lands online after a short (staggered)
+  // delay so a fleet-wide CALL connects them one after another.
+  void _beginConnect(int i, {int stagger = 0}) {
+    _cloneStatus[i] = _CloneStatus.connecting;
+    _cloneElapsed[i].value = 0;
+    _signalCall(i, true); // ring the real device if it's linked
+    _connectTimers[i]?.cancel();
+    _connectTimers[i] =
+        Timer(Duration(milliseconds: 900 + stagger * 220), () {
+      if (!mounted) return;
+      setState(() => _cloneStatus[i] = _CloneStatus.online);
+      _syncCloneTicker();
+      _persistFleet();
+    });
+  }
+
+  void _disconnect(int i) {
+    _connectTimers[i]?.cancel();
+    _connectTimers[i] = null;
+    _cloneStatus[i] = _CloneStatus.offline;
+    _cloneElapsed[i].value = 0;
+    _signalCall(i, false); // hang up the real device if it's linked
+  }
+
   void _toggleClone(int i) {
     setState(() {
-      _cloneLive[i] = !_cloneLive[i];
-      _cloneElapsed[i] = 0;
       _selectedClone = i; // calling/cutting a clone focuses its card
+      if (_cloneStatus[i] == _CloneStatus.offline) {
+        _beginConnect(i);
+      } else {
+        _disconnect(i); // cancel a dial-in-progress or hang up a live one
+      }
     });
     _syncCloneTicker();
+    _persistFleet();
+    _syncCallVoice();
   }
 
   void _callAllClones() {
     setState(() {
+      var stagger = 0;
       for (var i = 0; i < _cloneCount; i++) {
-        _cloneLive[i] = true;
-        _cloneElapsed[i] = 0;
+        // Skip empty slots — only created clones join the fleet call.
+        if (_clones[i] == null) continue;
+        if (_cloneStatus[i] == _CloneStatus.offline) {
+          _beginConnect(i, stagger: stagger++);
+        }
       }
     });
     _syncCloneTicker();
+    _persistFleet();
+    _syncCallVoice();
   }
 
   void _cutAllClones() {
     setState(() {
       for (var i = 0; i < _cloneCount; i++) {
-        _cloneLive[i] = false;
-        _cloneElapsed[i] = 0;
+        _disconnect(i);
       }
     });
     _syncCloneTicker();
+    _persistFleet();
+    _syncCallVoice();
+  }
+
+  /// Opens the real LAN walkie-talkie panel (mic + WiFi peer voice).
+  void _openWalkie() {
+    final walkie = _walkie ??= WalkieService(name: 'Master');
+    _walkiePanelOpen = true;
+    showDialog<void>(
+      context: context,
+      builder: (_) => WalkieDialog(walkie: walkie, theme: AppTheme.of(context)),
+    ).whenComplete(() {
+      _walkiePanelOpen = false;
+      // Re-assert call voice: if a call is active this re-opens the mic the
+      // panel's Close just muted; otherwise it releases the mic.
+      _syncCallVoice();
+    });
+  }
+
+  // ── Call voice (hands-free) ────────────────────────────────────────
+  // While any clone is on a call, the master keeps a live WalkieService with
+  // the mic OPEN so master↔clone(s) hear each other hands-free. Reuses the
+  // same WebRTC voice mesh as the walkie panel. Guarded by [_walkiePanelOpen]
+  // so ending a call never tears down a manually-opened walkie session.
+  bool _walkiePanelOpen = false;
+
+  void _syncCallVoice() {
+    final active = _anyActive;
+    () async {
+      if (active) {
+        final w = _walkie ??= WalkieService(name: 'Master');
+        if (!w.isReady) {
+          final ok = await w.start();
+          if (!ok) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                content: Text('Microphone needed for call voice — '
+                    'enable it in Settings.'),
+              ));
+            }
+            return;
+          }
+        }
+        w.setTalking(true); // hands-free: mic open for the whole call
+      } else if (!_walkiePanelOpen) {
+        final w = _walkie;
+        if (w != null) {
+          w.setTalking(false);
+          await w.stop();
+        }
+      }
+    }();
   }
 
   // Placeholder metrics — wire to real repositories later.
@@ -634,6 +1496,10 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               ),
             ),
           ),
+          // Incoming-call banner overlay — top layer, in-tree (no modal route),
+          // so a clone dialling the master is answerable from any screen.
+          if (_cloneLink.incomingFromClone.value != null)
+            _incomingCallBanner(_cloneLink.incomingFromClone.value!),
           ],
         ),
       ),
@@ -723,6 +1589,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               child: _SettingsPanelBody(
                 darkMode: _darkMode,
                 onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+                onCloneAccess: _openCloneAccess,
+                onLogout: _handleLogout,
                 onNoop: () {},
               ),
             ),
@@ -741,11 +1609,23 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
           // on each clone's detail page.
           child: openedLabel == 'Clones'
               ? _ClonesFilterColumn(
-                  live: _cloneLive,
-                  elapsed: _cloneElapsed,
-                  anyLive: _anyCloneLive,
+                  // SESSIONS lists only the created clones, by slot number.
+                  slotNumbers: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) i + 1,
+                  ],
+                  statuses: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) _cloneStatus[i],
+                  ],
+                  elapsed: [
+                    for (var i = 0; i < _cloneCount; i++)
+                      if (_clones[i] != null) _cloneElapsed[i],
+                  ],
+                  anyActive: _anyActive,
                   onCallAll: _callAllClones,
                   onCutAll: _cutAllClones,
+                  onWalkie: _openWalkie,
                 )
               : _FeatureFilterColumn(title: openedLabel),
         ),
@@ -756,7 +1636,14 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         // Stack children would otherwise composite on top of the
         // labelled tiles (visible bleed under empty cells in the
         // Cart bento — session-10 fix).
-        ..._buildOpenedTileGrid(openedLabel),
+        //
+        // Clones renders a scrollable, plan-gated fleet grid (created cards,
+        // empty "Create" slots, and locked upgrade teasers); every other tab
+        // keeps its fixed 3×2 sub-detail tile grid.
+        if (openedLabel == 'Clones')
+          _buildClonesGridRegion()
+        else
+          ..._buildOpenedTileGrid(openedLabel),
         if (_settingsPanelOn)
           Positioned(
             left: _oGridStartX + 3 * (_oTileW + _oGridGap), // col 4 (x=893)
@@ -767,6 +1654,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
               child: _SettingsPanelBody(
                 darkMode: _darkMode,
                 onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+                onCloneAccess: _openCloneAccess,
+                onLogout: _handleLogout,
                 onNoop: () {},
               ),
             ),
@@ -823,22 +1712,7 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
         final y = _oGridStartY + row * (_oTileH + _oGridGap);
         final labelIdx = row * 3 + innerCol;
         final Widget cell;
-        if (openedLabel == 'Clones') {
-          // Clone tiles are live call cards, not drill-in tiles. Their
-          // live/timer state is owned by the parent so the SESSIONS
-          // master control and the card share one source of truth.
-          final id = _cloneIdentities[labelIdx % _cloneIdentities.length];
-          cell = _CloneCard(
-            number: labelIdx + 1,
-            name: id.$1,
-            subtitle: id.$2,
-            live: _cloneLive[labelIdx],
-            elapsedSeconds: _cloneElapsed[labelIdx],
-            onToggle: () => _toggleClone(labelIdx),
-            selected: _selectedClone == labelIdx,
-            onSelect: () => setState(() => _selectedClone = labelIdx),
-          );
-        } else if (labels != null) {
+        if (labels != null) {
           cell = _LabelledTile(
             label: labels[labelIdx],
             onTap: () => setState(() => _openSubIndex = labelIdx + 1),
@@ -856,6 +1730,72 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
       }
     }
     return widgets;
+  }
+
+  /// Clones-only: a scrollable, plan-gated fleet grid filling the tile region
+  /// (cols 1-3, or 1-2 when the Settings panel is open). Renders up to the
+  /// plan's [SubscriptionPlanX.displaySlots]: created clones as call cards,
+  /// empty in-capacity slots as "Create Clone" tiles, and slots beyond the
+  /// plan's capacity as locked upgrade teasers. Scrolls vertically once the
+  /// unlocked fleet exceeds the two visible rows.
+  Widget _buildClonesGridRegion() {
+    final cols = _settingsPanelOn ? 2 : 3;
+    final width = _settingsPanelOn
+        ? (_oTileW * 2 + _oGridGap)
+        : (_oTileW * 3 + _oGridGap * 2);
+    final display = _plan.displaySlots;
+    return Positioned(
+      left: _oGridStartX + (_oTileW + _oGridGap), // col 1 (x=389)
+      top: _oGridStartY,
+      width: width,
+      height: _oTileH * 2 + _oGridGap,
+      // Rebuild the grid whenever the set of live satellites changes so each
+      // card's presence pill reflects real LAN device presence (this updates
+      // from link timers/packets, not setState — hence the listenable).
+      child: ValueListenableBuilder<Set<String>>(
+        valueListenable: _cloneLink.onlineClones,
+        builder: (_, online, __) => GridView.builder(
+          controller: _clonesGridCtrl,
+          padding: EdgeInsets.zero,
+          physics: const ClampingScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: cols,
+            mainAxisSpacing: _oGridGap,
+            crossAxisSpacing: _oGridGap,
+            childAspectRatio: _oTileW / _oTileH,
+          ),
+          itemCount: display,
+          itemBuilder: (_, i) {
+            final record = _clones[i];
+            if (record != null) {
+              // A created clone always shows as a card (even if it now sits
+              // beyond a downgraded plan's capacity).
+              return _CloneCard(
+                number: i + 1,
+                name: record.name,
+                subtitle: record.department,
+                status: _cloneStatus[i],
+                linked: record.cloneId.isNotEmpty &&
+                    online.contains(record.cloneId),
+                elapsed: _cloneElapsed[i],
+                onToggle: () => _toggleClone(i),
+                selected: _selectedClone == i,
+                onSelect: () => setState(() => _selectedClone = i),
+                onDelete: () => _deleteCloneAt(i),
+              );
+            }
+            if (i < _capacity) {
+              return _CreateCloneTile(onTap: () => _createCloneAt(i));
+            }
+            // Beyond capacity, empty → locked upgrade teaser.
+            return _LockedCloneTile(
+              targetPlan: _plan.next,
+              onTap: _openCloneAccess, // hub → Change plan
+            );
+          },
+        ),
+      ),
+    );
   }
 
   /// Build the LANDING tile grid — 4×2 of white text-labelled tab
@@ -948,6 +1888,8 @@ class _MasterDashboardScreenState extends State<MasterDashboardScreen> {
             child: _SettingsPanelBody(
               darkMode: _darkMode,
               onToggleTheme: () => setState(() => _darkMode = !_darkMode),
+              onCloneAccess: _openCloneAccess,
+              onLogout: _handleLogout,
               onNoop: () {},
             ),
           ),
@@ -1798,6 +2740,14 @@ const Color _oCutRed = Color(0xFFF64900); // card CUT button — orange-red
 const Color _oCloneCardBg = Color(0xFFD9D9D9); // idle card — fixed light grey
 const Color _oCloneCardText = Color(0xFF63605B); // card name/sub/time (both states)
 
+// Connection lifecycle for a simulated clone (Satellite) session.
+//   offline    → parked, grey dot, green CALL, clock 00:00
+//   connecting → dialling, amber dot, red CUT, clock "Connecting…"
+//   online     → connected, green dot, red CUT, clock ticking
+enum _CloneStatus { offline, connecting, online }
+
+const Color _oCloneConnecting = Color(0xFFF4A100); // amber — connecting dot
+
 // Placeholder clone identities — name + posting. Wire to real fleet
 // records later; cycles if the grid ever grows past six.
 const List<(String, String)> _cloneIdentities = [
@@ -1810,50 +2760,229 @@ const List<(String, String)> _cloneIdentities = [
 ];
 
 // ---------------------------------------------------------------------------
+// Empty-slot tile on the Clones grid — the master taps it to CREATE a clone
+// (register a new Satellite). Occupies the same 250×350 footprint as a call
+// card; theme-aware since it's a new element (not a client-locked mock).
+// ---------------------------------------------------------------------------
+
+class _CreateCloneTile extends StatelessWidget {
+  final VoidCallback onTap;
+  const _CreateCloneTile({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Material(
+      color: t.cardBg.withValues(alpha: t.dark ? 0.35 : 0.55),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: t.cardText.withValues(alpha: 0.28),
+              width: 1.5,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: const BoxDecoration(
+                  color: _oCloneOrange,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.add, color: Colors.white, size: 38),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Create Clone',
+                style: TextStyle(
+                  color: t.cardText,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -0.4,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Empty slot',
+                style: TextStyle(
+                  color: t.cardText.withValues(alpha: 0.55),
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Locked fleet slot — shown for slots beyond the current plan's capacity.
+// A padlock + upgrade teaser naming the tier that unlocks it; tapping opens
+// the Clone Access hub (where the plan can be changed). Same 250×350 footprint.
+// ---------------------------------------------------------------------------
+
+class _LockedCloneTile extends StatelessWidget {
+  final SubscriptionPlan? targetPlan;
+  final VoidCallback onTap;
+  const _LockedCloneTile({required this.targetPlan, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = AppTheme.of(context);
+    return Material(
+      color: t.cardBg.withValues(alpha: t.dark ? 0.18 : 0.4),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: t.cardText.withValues(alpha: 0.16),
+              width: 1.5,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.lock_outline,
+                  size: 44, color: t.cardText.withValues(alpha: 0.4)),
+              const SizedBox(height: 14),
+              Text(
+                'Locked',
+                style: TextStyle(
+                  color: t.cardText.withValues(alpha: 0.6),
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                child: Text(
+                  targetPlan == null
+                      ? 'Max fleet reached'
+                      : 'Upgrade to ${targetPlan!.label}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: _oCloneOrange,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Clone call card — one per clone tile on the Clones overview grid.
 //   Idle → grey card, green CALL, clock parked at 00:00.
 //   Live → mustard-yellow card, red CUT, clock ticking.
 // Stateless: its live/timer state is owned by the parent so the SESSIONS
 // master control ("call all") and this card stay in lockstep. Tap CALL/
 // CUT toggles just this clone; tapping the body selects it (blue border).
-// The badge is a fixed "1" on every card per client.
+// Long-press removes the clone (frees the slot). The badge is the slot number.
 // ---------------------------------------------------------------------------
 
 class _CloneCard extends StatelessWidget {
   final int number; // badge numeral — the clone's sequence (1, 2, 3 …)
   final String name;
   final String subtitle;
-  final bool live;
-  final int elapsedSeconds;
+  final _CloneStatus status;
+  // Whether the satellite DEVICE is signed in over the LAN right now. This is
+  // device presence (CloneLinkService.onlineClones) — a separate axis from the
+  // CALL/session [status] above: a clone can be linked without being on a call.
+  final bool linked;
+  final ValueListenable<int> elapsed;
   final VoidCallback onToggle; // CALL/CUT for this one clone
   final bool selected;
   final VoidCallback onSelect;
+  final VoidCallback onDelete; // long-press to remove this clone
   const _CloneCard({
     required this.number,
     required this.name,
     required this.subtitle,
-    required this.live,
-    required this.elapsedSeconds,
+    required this.status,
+    required this.linked,
+    required this.elapsed,
     required this.onToggle,
     required this.selected,
     required this.onSelect,
+    required this.onDelete,
   });
 
   String _fmt(int s) =>
       '${(s ~/ 60).toString().padLeft(2, '0')}:${(s % 60).toString().padLeft(2, '0')}';
+
+  /// Small pill showing whether the satellite device is currently linked over
+  /// the LAN. Additive corner element — kept off the client-locked centre.
+  Widget _presence() {
+    final color =
+        linked ? _oClonesGreen : _oCloneCardText.withValues(alpha: 0.45);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: linked
+            ? _oClonesGreen.withValues(alpha: 0.14)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.55), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 5),
+          Text(
+            linked ? 'LINKED' : 'OFFLINE',
+            style: TextStyle(
+              color: color,
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     // Fixed Figma colours (the card is a client-locked design element, so
     // it stays light grey / mustard in both app themes to match the mock).
     // Absolute-positioned to the exact Figma offsets on the 250×350 tile.
+    final online = status == _CloneStatus.online;
+    final connecting = status == _CloneStatus.connecting;
     return GestureDetector(
       onTap: onSelect,
+      onLongPress: onDelete,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
         curve: Curves.easeOutCubic,
         decoration: BoxDecoration(
-          color: live ? _oCloneLiveBg : _oCloneCardBg,
+          // Card lights up (mustard) once actually connected; grey while
+          // parked or dialling.
+          color: online ? _oCloneLiveBg : _oCloneCardBg,
           borderRadius: BorderRadius.circular(10),
           border: selected
               ? Border.all(
@@ -1862,6 +2991,14 @@ class _CloneCard extends StatelessWidget {
         ),
         child: Stack(
           children: [
+            // Live device-presence badge — top-left, clear of the centred
+            // numeral. Green when the satellite device is signed in over the
+            // LAN, muted when not. Distinct from the CALL/session state.
+            Positioned(
+              top: 10,
+              left: 10,
+              child: _presence(),
+            ),
             // Badge — the clone's sequence number, 96px Bold, centred near
             // the top.
             Positioned(
@@ -1925,22 +3062,38 @@ class _CloneCard extends StatelessWidget {
               right: 0,
               child: Center(child: _callButton()),
             ),
-            // Clock — 13px Regular.
+            // Clock — 13px Regular. Only this label rebuilds on the tick.
+            // Online → ticking timer; connecting → "Connecting…"; else 00:00.
             Positioned(
               top: 285,
               left: 8,
               right: 8,
-              child: Text(
-                live ? _fmt(elapsedSeconds) : '00:00',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: _oCloneCardText,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w400,
-                  height: 1.0042,
-                  letterSpacing: 0.91,
-                ),
-              ),
+              child: online
+                  ? ValueListenableBuilder<int>(
+                      valueListenable: elapsed,
+                      builder: (_, seconds, __) => Text(
+                        _fmt(seconds),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: _oCloneCardText,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                          height: 1.0042,
+                          letterSpacing: 0.91,
+                        ),
+                      ),
+                    )
+                  : Text(
+                      connecting ? 'Connecting…' : '00:00',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: _oCloneCardText,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w400,
+                        height: 1.0042,
+                        letterSpacing: 0.91,
+                      ),
+                    ),
             ),
           ],
         ),
@@ -1949,7 +3102,10 @@ class _CloneCard extends StatelessWidget {
   }
 
   Widget _callButton() {
-    final color = live ? _oCutRed : _oCallGreen;
+    // Offline → green CALL; connecting or online → red CUT (also cancels a
+    // dial in progress).
+    final offline = status == _CloneStatus.offline;
+    final color = offline ? _oCallGreen : _oCutRed;
     return Material(
       color: color,
       shape: const CircleBorder(),
@@ -1963,7 +3119,7 @@ class _CloneCard extends StatelessWidget {
           height: 60,
           child: Center(
             child: Text(
-              live ? 'CUT' : 'CALL',
+              offline ? 'CALL' : 'CUT',
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -1979,17 +3135,21 @@ class _CloneCard extends StatelessWidget {
 }
 
 class _ClonesFilterColumn extends StatelessWidget {
-  final List<bool> live;
-  final List<int> elapsed;
-  final bool anyLive;
+  final List<int> slotNumbers; // 1-based slot label per created clone
+  final List<_CloneStatus> statuses;
+  final List<ValueListenable<int>> elapsed;
+  final bool anyActive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
+  final VoidCallback onWalkie;
   const _ClonesFilterColumn({
-    required this.live,
+    required this.slotNumbers,
+    required this.statuses,
     required this.elapsed,
-    required this.anyLive,
+    required this.anyActive,
     required this.onCallAll,
     required this.onCutAll,
+    required this.onWalkie,
   });
 
   @override
@@ -2049,11 +3209,13 @@ class _ClonesFilterColumn extends StatelessWidget {
           child: SizedBox(
             width: 210,
             child: _CloneSessionsConsole(
-              live: live,
+              slotNumbers: slotNumbers,
+              statuses: statuses,
               elapsed: elapsed,
-              anyLive: anyLive,
+              anyActive: anyActive,
               onCallAll: onCallAll,
               onCutAll: onCutAll,
+              onWalkie: onWalkie,
             ),
           ),
         ),
@@ -2069,17 +3231,21 @@ class _ClonesFilterColumn extends StatelessWidget {
 // once, and each row mirrors whatever state its clone is currently in
 // (whether that came from the master or the card's own CALL/CUT).
 class _CloneSessionsConsole extends StatelessWidget {
-  final List<bool> live;
-  final List<int> elapsed;
-  final bool anyLive;
+  final List<int> slotNumbers; // 1-based slot label per created clone
+  final List<_CloneStatus> statuses;
+  final List<ValueListenable<int>> elapsed;
+  final bool anyActive;
   final VoidCallback onCallAll;
   final VoidCallback onCutAll;
+  final VoidCallback onWalkie;
   const _CloneSessionsConsole({
-    required this.live,
+    required this.slotNumbers,
+    required this.statuses,
     required this.elapsed,
-    required this.anyLive,
+    required this.anyActive,
     required this.onCallAll,
     required this.onCutAll,
+    required this.onWalkie,
   });
 
   String _fmt(int totalSeconds) {
@@ -2106,16 +3272,17 @@ class _CloneSessionsConsole extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 14),
-        for (var i = 0; i < live.length; i++) _sessionRow(t, i),
+        for (var i = 0; i < statuses.length; i++) _sessionRow(t, i),
         const SizedBox(height: 14),
-        // Connection dots — one per clone; green while that clone is live.
+        // Connection dots — one per clone; green online, amber connecting,
+        // grey offline.
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            for (var i = 0; i < live.length; i++)
+            for (var i = 0; i < statuses.length; i++)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: _dot(t, on: live[i]),
+                child: _dot(t, status: statuses[i]),
               ),
           ],
         ),
@@ -2133,6 +3300,37 @@ class _CloneSessionsConsole extends StatelessWidget {
             height: 1.3,
           ),
         ),
+        const SizedBox(height: 16),
+        // Real LAN walkie-talkie (WiFi voice) — separate from the fleet
+        // call simulation above.
+        InkWell(
+          onTap: onWalkie,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE87722),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.settings_input_antenna,
+                    color: Colors.white, size: 16),
+                SizedBox(width: 8),
+                Text(
+                  'LAN WALKIE',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -2141,14 +3339,15 @@ class _CloneSessionsConsole extends StatelessWidget {
   // the Figma mock. The whole column belongs to SESSIONS now that the
   // filters are gone, so the rows can breathe.
   Widget _sessionRow(AppTheme t, int i) {
-    final on = live[i];
-    final seconds = on ? elapsed[i] : 0;
+    final status = statuses[i];
+    final online = status == _CloneStatus.online;
+    final connecting = status == _CloneStatus.connecting;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         children: [
           Text(
-            'CLONE :0${i + 1}',
+            'CLONE :${slotNumbers[i].toString().padLeft(2, '0')}',
             style: TextStyle(
               color: t.panelText,
               fontSize: 15,
@@ -2156,15 +3355,24 @@ class _CloneSessionsConsole extends StatelessWidget {
               letterSpacing: 2.4,
             ),
           ),
-          Text(
-            _fmt(seconds),
-            style: TextStyle(
-              // Live clocks read in the fleet green; parked clocks stay
-              // in Figma's black-80% so the row still reads when idle.
-              color: on ? _oCallGreen : t.panelText,
-              fontSize: 24,
-              fontWeight: FontWeight.w300,
-              letterSpacing: 0.48,
+          // Only this clock rebuilds on the per-second tick. Connecting shows
+          // a fixed-width "--:--" (amber) so the FittedBox doesn't reflow.
+          ValueListenableBuilder<int>(
+            valueListenable: elapsed[i],
+            builder: (_, value, __) => Text(
+              connecting ? '--:--' : _fmt(online ? value : 0),
+              style: TextStyle(
+                // Online clocks read in the fleet green, connecting in amber,
+                // parked clocks stay in Figma's black-80%.
+                color: online
+                    ? _oCallGreen
+                    : connecting
+                        ? _oCloneConnecting
+                        : t.panelText,
+                fontSize: 24,
+                fontWeight: FontWeight.w300,
+                letterSpacing: 0.48,
+              ),
             ),
           ),
         ],
@@ -2172,7 +3380,12 @@ class _CloneSessionsConsole extends StatelessWidget {
     );
   }
 
-  Widget _dot(AppTheme t, {required bool on}) {
+  Widget _dot(AppTheme t, {required _CloneStatus status}) {
+    final color = switch (status) {
+      _CloneStatus.online => _oCallGreen,
+      _CloneStatus.connecting => _oCloneConnecting,
+      _CloneStatus.offline => t.divider,
+    };
     return AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOutCubic,
@@ -2180,27 +3393,27 @@ class _CloneSessionsConsole extends StatelessWidget {
       height: 11,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: on ? _oCallGreen : t.divider,
+        color: color,
       ),
     );
   }
 
   Widget _callButton() {
-    final color = anyLive ? _oCallRed : _oCallGreen;
+    final color = anyActive ? _oCallRed : _oCallGreen;
     return Material(
       color: color,
       shape: const CircleBorder(),
       elevation: 4,
       shadowColor: color.withValues(alpha: 0.5),
       child: InkWell(
-        onTap: anyLive ? onCutAll : onCallAll,
+        onTap: anyActive ? onCutAll : onCallAll,
         customBorder: const CircleBorder(),
         child: SizedBox(
           width: 60,
           height: 60,
           child: Center(
             child: Text(
-              anyLive ? 'END' : 'CALL',
+              anyActive ? 'END' : 'CALL',
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -2610,10 +3823,14 @@ class _RightColumnPanel extends StatelessWidget {
 class _SettingsPanelBody extends StatelessWidget {
   final bool darkMode;
   final VoidCallback onToggleTheme;
+  final VoidCallback onCloneAccess;
+  final VoidCallback onLogout;
   final VoidCallback onNoop;
   const _SettingsPanelBody({
     required this.darkMode,
     required this.onToggleTheme,
+    required this.onCloneAccess,
+    required this.onLogout,
     required this.onNoop,
   });
 
@@ -2652,12 +3869,17 @@ class _SettingsPanelBody extends StatelessWidget {
             label: 'Language',
             onTap: onNoop,
           ),
+          _PanelRow(
+            icon: Icons.shield_outlined,
+            label: 'Clone Access',
+            onTap: onCloneAccess,
+          ),
           const Spacer(),
           Divider(color: t.divider, height: 1),
           _PanelRow(
             icon: Icons.logout_outlined,
             label: 'Logout',
-            onTap: onNoop,
+            onTap: onLogout,
           ),
         ],
       ),
